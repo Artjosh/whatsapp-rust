@@ -214,6 +214,8 @@ pub enum NewsletterQuestionType {
 pub enum NewsletterVerification {
     Verified,
     Unverified,
+    /// A value this library does not model, as the server spelled it.
+    Other(String),
 }
 
 /// Newsletter state.
@@ -223,6 +225,9 @@ pub enum NewsletterState {
     Active,
     Suspended,
     Geosuspended,
+    /// A state this library does not model, as the server spelled it: a
+    /// deleted channel, for one, reads `DELETED`.
+    Other(String),
 }
 
 /// The viewer's role in a newsletter.
@@ -1100,6 +1105,30 @@ fn parse_newsletter_role(raw: &str) -> Option<NewsletterRole> {
     }
 }
 
+/// The server spells the channel state upper case (`ACTIVE`, `DELETED`); the
+/// comparison ignores case for the same reason [`parse_newsletter_role`] does.
+fn parse_newsletter_state(raw: &str) -> NewsletterState {
+    if raw.eq_ignore_ascii_case("active") {
+        NewsletterState::Active
+    } else if raw.eq_ignore_ascii_case("suspended") {
+        NewsletterState::Suspended
+    } else if raw.eq_ignore_ascii_case("geosuspended") {
+        NewsletterState::Geosuspended
+    } else {
+        NewsletterState::Other(raw.to_string())
+    }
+}
+
+fn parse_newsletter_verification(raw: &str) -> NewsletterVerification {
+    if raw.eq_ignore_ascii_case("verified") {
+        NewsletterVerification::Verified
+    } else if raw.eq_ignore_ascii_case("unverified") {
+        NewsletterVerification::Unverified
+    } else {
+        NewsletterVerification::Other(raw.to_string())
+    }
+}
+
 /// A profile exists only once it carries a name; WA Web drops a nameless one.
 fn parse_admin_profile(value: &serde_json::Value) -> Option<NewsletterAdminProfile> {
     let name = value["name"].as_str()?;
@@ -1191,16 +1220,14 @@ fn parse_newsletter_metadata(
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
 
-    let verification = match thread["verification"].as_str() {
-        Some("VERIFIED") => NewsletterVerification::Verified,
-        _ => NewsletterVerification::Unverified,
-    };
+    let verification = thread["verification"].as_str().map_or(
+        NewsletterVerification::Unverified,
+        parse_newsletter_verification,
+    );
 
-    let state = match value["state"]["type"].as_str() {
-        Some("suspended") => NewsletterState::Suspended,
-        Some("geosuspended") => NewsletterState::Geosuspended,
-        _ => NewsletterState::Active,
-    };
+    let state = value["state"]["type"]
+        .as_str()
+        .map_or(NewsletterState::Active, parse_newsletter_state);
 
     let picture_url = thread["picture"]["direct_path"]
         .as_str()
@@ -1731,6 +1758,91 @@ mod tests {
 
     fn newsletter_jid() -> Jid {
         "120363000000000001@newsletter".parse().expect("jid")
+    }
+
+    mod metadata_state {
+        use super::*;
+
+        fn metadata_with(state: Option<&str>, verification: Option<&str>) -> NewsletterMetadata {
+            let mut node = json!({
+                "id": "120363000000000001@newsletter",
+                "thread_metadata": { "name": { "text": "x" } }
+            });
+            if let Some(state) = state {
+                node["state"] = json!({ "type": state });
+            }
+            if let Some(verification) = verification {
+                node["thread_metadata"]["verification"] = json!(verification);
+            }
+            parse_newsletter_metadata(&node).expect("metadata")
+        }
+
+        #[test]
+        fn state_is_read_in_the_servers_spelling() {
+            assert_eq!(
+                metadata_with(Some("ACTIVE"), None).state,
+                NewsletterState::Active
+            );
+            assert_eq!(
+                metadata_with(Some("SUSPENDED"), None).state,
+                NewsletterState::Suspended
+            );
+            assert_eq!(
+                metadata_with(Some("GEOSUSPENDED"), None).state,
+                NewsletterState::Geosuspended
+            );
+        }
+
+        #[test]
+        fn state_ignores_case() {
+            assert_eq!(
+                metadata_with(Some("suspended"), None).state,
+                NewsletterState::Suspended
+            );
+            assert_eq!(
+                metadata_with(Some("GeoSuspended"), None).state,
+                NewsletterState::Geosuspended
+            );
+        }
+
+        /// `DELETED` is what the delete mutation answers with; reading it as
+        /// `Active` would tell the caller a deleted channel is live.
+        #[test]
+        fn unknown_state_keeps_the_servers_token() {
+            assert_eq!(
+                metadata_with(Some("DELETED"), None).state,
+                NewsletterState::Other("DELETED".into())
+            );
+        }
+
+        #[test]
+        fn absent_state_is_active() {
+            assert_eq!(metadata_with(None, None).state, NewsletterState::Active);
+        }
+
+        #[test]
+        fn verification_ignores_case_and_keeps_unknown_tokens() {
+            assert_eq!(
+                metadata_with(None, Some("VERIFIED")).verification,
+                NewsletterVerification::Verified
+            );
+            assert_eq!(
+                metadata_with(None, Some("verified")).verification,
+                NewsletterVerification::Verified
+            );
+            assert_eq!(
+                metadata_with(None, Some("UNVERIFIED")).verification,
+                NewsletterVerification::Unverified
+            );
+            assert_eq!(
+                metadata_with(None, Some("PENDING_REVIEW")).verification,
+                NewsletterVerification::Other("PENDING_REVIEW".into())
+            );
+            assert_eq!(
+                metadata_with(None, None).verification,
+                NewsletterVerification::Unverified
+            );
+        }
     }
 
     mod my_addons {
