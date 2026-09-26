@@ -348,6 +348,10 @@ pub struct NewsletterMessage {
     /// Message type: `text`, `media` or `poll`. An edit or a revocation is not
     /// a type of its own, see [`edit`](Self::edit).
     pub message_type: NewsletterMessageType,
+    /// The `type` attribute exactly as the server sent it, `None` when it was
+    /// absent. [`message_type`](Self::message_type) reads an absent attribute
+    /// as `Text`; this is how to tell the two apart, or to pass the token on.
+    pub message_type_raw: Option<String>,
     /// The `edit` attribute: [`EditAttribute::AdminEdit`] (`3`) for an edited
     /// message, [`EditAttribute::AdminRevoke`] (`8`) for a revoked one.
     /// [`EditAttribute::Empty`] when the attribute is absent, which is the
@@ -397,8 +401,12 @@ pub struct NewsletterMessage {
     ///
     /// Read only when [`message_type`](Self::message_type) is
     /// [`NewsletterMessageType::Poll`], the same scoping WA Web applies, so a
-    /// `polltype` on anything else is ignored rather than recorded.
+    /// `polltype` on anything else is not read as a stage here. The token
+    /// itself is in [`poll_type_raw`](Self::poll_type_raw).
     pub poll_type: Option<PollType>,
+    /// `<meta polltype>` exactly as the server sent it, whatever the message
+    /// type and whether or not [`PollType`] has a variant for it.
+    pub poll_type_raw: Option<String>,
     /// `<meta contenttype>`.
     pub content_type: Option<String>,
     /// `<meta questiontype>`: `question` for a channel question, `reply` for an
@@ -1432,11 +1440,10 @@ fn parse_newsletter_messages_response(
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
 
-        let message_type = msg_node
-            .get_attr("type")
-            .map(|v| v.as_str())
-            .map(|s| NewsletterMessageType::from(s.as_ref()))
-            .unwrap_or(NewsletterMessageType::Text);
+        let message_type_raw = msg_node.get_attr("type").map(|v| v.as_str().into_owned());
+        let message_type = message_type_raw
+            .as_deref()
+            .map_or(NewsletterMessageType::Text, NewsletterMessageType::from);
 
         let edit = msg_node
             .get_attr("edit")
@@ -1473,6 +1480,7 @@ fn parse_newsletter_messages_response(
             server_id,
             timestamp,
             message_type,
+            message_type_raw,
             edit,
             is_sender,
             message,
@@ -1485,6 +1493,7 @@ fn parse_newsletter_messages_response(
             original_timestamp: meta.original_timestamp,
             last_edit_timestamp_ms: meta.last_edit_timestamp_ms,
             poll_type: meta.poll_type,
+            poll_type_raw: meta.poll_type_raw,
             content_type: meta.content_type,
             question_type: meta.question_type,
             message_association_type: meta.message_association_type,
@@ -1510,6 +1519,7 @@ struct MessageMeta {
     original_timestamp: Option<u64>,
     last_edit_timestamp_ms: Option<u64>,
     poll_type: Option<PollType>,
+    poll_type_raw: Option<String>,
     content_type: Option<String>,
     question_type: Option<NewsletterQuestionType>,
     message_association_type: Option<NewsletterMessageAssociationType>,
@@ -1522,6 +1532,7 @@ fn parse_message_meta(msg_node: &NodeRef<'_>, message_type: &NewsletterMessageTy
         return MessageMeta::default();
     };
     let mut attrs = meta_node.attrs();
+    let poll_type_raw = attrs.optional_string("polltype").map(|s| s.into_owned());
 
     MessageMeta {
         // Seconds, while `msg_edit_t` right below is milliseconds. The two
@@ -1531,12 +1542,13 @@ fn parse_message_meta(msg_node: &NodeRef<'_>, message_type: &NewsletterMessageTy
         // WA Web scopes `polltype` to poll envelopes, so a value on any other
         // type is not the poll stage and is not recorded as one.
         poll_type: if *message_type == NewsletterMessageType::Poll {
-            attrs
-                .optional_string("polltype")
-                .and_then(|s| PollType::try_from(s.as_ref()).ok())
+            poll_type_raw
+                .as_deref()
+                .and_then(|s| PollType::try_from(s).ok())
         } else {
             None
         },
+        poll_type_raw,
         content_type: attrs.optional_string("contenttype").map(|s| s.into_owned()),
         question_type: attrs
             .optional_string("questiontype")
@@ -2749,6 +2761,70 @@ mod tests {
 
         let msg = &parse_newsletter_messages_response(&response.as_node_ref()).unwrap()[0];
         assert_eq!(msg.poll_type, None);
+        assert_eq!(msg.poll_type_raw.as_deref(), Some("creation"));
+    }
+
+    mod raw_tokens {
+        use super::*;
+
+        fn parse_one(message: NodeBuilder) -> NewsletterMessage {
+            let response = history_response(vec![message.attr("server_id", "8").build()]);
+            parse_newsletter_messages_response(&response.as_node_ref())
+                .unwrap()
+                .remove(0)
+        }
+
+        fn with_polltype(message: NodeBuilder, polltype: &str) -> NodeBuilder {
+            message.children([NodeBuilder::new("meta").attr("polltype", polltype).build()])
+        }
+
+        #[test]
+        fn a_known_poll_stage_keeps_its_token() {
+            let msg = parse_one(with_polltype(
+                NodeBuilder::new("message").attr("type", "poll"),
+                "creation",
+            ));
+            assert_eq!(msg.message_type, NewsletterMessageType::Poll);
+            assert_eq!(msg.message_type_raw.as_deref(), Some("poll"));
+            assert_eq!(msg.poll_type, Some(PollType::Creation));
+            assert_eq!(msg.poll_type_raw.as_deref(), Some("creation"));
+        }
+
+        /// The typed field still defaults to `Text`; the raw one tells the
+        /// caller the server sent no `type` at all.
+        #[test]
+        fn an_absent_type_is_absent_in_the_raw_token() {
+            let msg = parse_one(NodeBuilder::new("message"));
+            assert_eq!(msg.message_type, NewsletterMessageType::Text);
+            assert_eq!(msg.message_type_raw, None);
+        }
+
+        #[test]
+        fn an_unknown_poll_stage_keeps_its_token() {
+            let msg = parse_one(with_polltype(
+                NodeBuilder::new("message").attr("type", "poll"),
+                "future_stage",
+            ));
+            assert_eq!(msg.poll_type, None);
+            assert_eq!(msg.poll_type_raw.as_deref(), Some("future_stage"));
+        }
+
+        #[test]
+        fn a_message_without_polltype_has_no_raw_token() {
+            let msg = parse_one(NodeBuilder::new("message").attr("type", "poll"));
+            assert_eq!(msg.poll_type, None);
+            assert_eq!(msg.poll_type_raw, None);
+        }
+
+        #[test]
+        fn an_unknown_type_keeps_its_token_in_both_fields() {
+            let msg = parse_one(NodeBuilder::new("message").attr("type", "hologram"));
+            assert_eq!(
+                msg.message_type,
+                NewsletterMessageType::Other("hologram".into())
+            );
+            assert_eq!(msg.message_type_raw.as_deref(), Some("hologram"));
+        }
     }
 
     /// A `<vote>` whose content is not a 32-byte digest, or whose required
