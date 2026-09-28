@@ -80,6 +80,24 @@ pub fn message_key(
     }
 }
 
+/// Every `index[0]` `dispatch_chat_mutation_outcome` claims; a kind missing
+/// here never reaches its match arm.
+const CHAT_ACTION_KINDS: &[&str] = &[
+    "mute",
+    "pin",
+    "pin_v1",
+    "archive",
+    "star",
+    "contact",
+    "mark_chat_as_read",
+    "markChatAsRead",
+    "deleteChat",
+    "clearChat",
+    "lock",
+    "userStatusMute",
+    "deleteMessageForMe",
+];
+
 /// Dispatch inbound chat mutations, returning the [`AppStateDispatchOutcome`]
 /// for the semantic per-mutation log line. A new WhatsApp command that falls
 /// through every handler shows up as `Unclaimed` instead of vanishing
@@ -114,31 +132,18 @@ pub(crate) fn dispatch_chat_mutation_outcome(
         return AppStateDispatchOutcome::Unclaimed;
     }
 
-    if !matches!(
-        kind.as_str(),
-        "mute"
-            | "pin"
-            | "pin_v1"
-            | "archive"
-            | "star"
-            | "contact"
-            | "mark_chat_as_read"
-            | "markChatAsRead"
-            | "deleteChat"
-            | "clearChat"
-            | "lock"
-            | "userStatusMute"
-            | "deleteMessageForMe"
-    ) {
+    if !CHAT_ACTION_KINDS.contains(&kind.as_str()) {
         return AppStateDispatchOutcome::Unclaimed;
     }
 
-    let ts = m
-        .action_value
-        .as_ref()
-        .and_then(|v| v.timestamp)
-        .unwrap_or(0);
-    let time = wacore::time::from_millis_or_now(ts);
+    let ts = m.action_value.as_ref().and_then(|v| v.timestamp);
+    let action_timestamp = ts.and_then(wacore::time::from_millis);
+    // `timestamp` predates `action_timestamp` and keeps its fallbacks (epoch
+    // for a missing value, now for an unrepresentable one) so existing
+    // consumers see no change. Neither is an instant the server sent, which
+    // is why a consumer that must tell a replay from a live change reads
+    // `action_timestamp` instead (#1551).
+    let time = wacore::time::from_millis_or_now(ts.unwrap_or(0));
     let jid: Jid = if m.index.len() > 1 {
         match m.index[1].parse() {
             Ok(j) => j,
@@ -168,6 +173,7 @@ pub(crate) fn dispatch_chat_mutation_outcome(
                     MuteUpdate::builder()
                         .jid(jid)
                         .timestamp(time)
+                        .maybe_action_timestamp(action_timestamp)
                         .action(Box::new(act))
                         .from_full_sync(event_full_sync)
                         .build(),
@@ -185,6 +191,7 @@ pub(crate) fn dispatch_chat_mutation_outcome(
                     PinUpdate::builder()
                         .jid(jid)
                         .timestamp(time)
+                        .maybe_action_timestamp(action_timestamp)
                         .action(Box::new(act))
                         .from_full_sync(event_full_sync)
                         .build(),
@@ -202,6 +209,7 @@ pub(crate) fn dispatch_chat_mutation_outcome(
                     ArchiveUpdate::builder()
                         .jid(jid)
                         .timestamp(time)
+                        .maybe_action_timestamp(action_timestamp)
                         .action(Box::new(act))
                         .from_full_sync(event_full_sync)
                         .build(),
@@ -231,6 +239,7 @@ pub(crate) fn dispatch_chat_mutation_outcome(
                         .message_id(message_id)
                         .from_me(from_me)
                         .timestamp(time)
+                        .maybe_action_timestamp(action_timestamp)
                         .action(Box::new(act))
                         .from_full_sync(event_full_sync)
                         .build(),
@@ -245,6 +254,7 @@ pub(crate) fn dispatch_chat_mutation_outcome(
                 ContactRemoved::builder()
                     .jid(jid)
                     .timestamp(time)
+                    .maybe_action_timestamp(action_timestamp)
                     .from_full_sync(event_full_sync)
                     .build(),
             ));
@@ -258,6 +268,7 @@ pub(crate) fn dispatch_chat_mutation_outcome(
                     ContactUpdate::builder()
                         .jid(jid)
                         .timestamp(time)
+                        .maybe_action_timestamp(action_timestamp)
                         .action(Box::new(act))
                         .from_full_sync(event_full_sync)
                         .build(),
@@ -275,6 +286,7 @@ pub(crate) fn dispatch_chat_mutation_outcome(
                     MarkChatAsReadUpdate::builder()
                         .jid(jid)
                         .timestamp(time)
+                        .maybe_action_timestamp(action_timestamp)
                         .action(Box::new(act))
                         .from_full_sync(event_full_sync)
                         .build(),
@@ -295,6 +307,7 @@ pub(crate) fn dispatch_chat_mutation_outcome(
                         .jid(jid)
                         .delete_media(delete_media)
                         .timestamp(time)
+                        .maybe_action_timestamp(action_timestamp)
                         .action(Box::new(act))
                         .from_full_sync(event_full_sync)
                         .build(),
@@ -319,6 +332,7 @@ pub(crate) fn dispatch_chat_mutation_outcome(
                         .delete_starred(delete_starred)
                         .delete_media(delete_media)
                         .timestamp(time)
+                        .maybe_action_timestamp(action_timestamp)
                         .action(Box::new(act))
                         .from_full_sync(event_full_sync)
                         .build(),
@@ -336,6 +350,7 @@ pub(crate) fn dispatch_chat_mutation_outcome(
                     LockChatUpdate::builder()
                         .jid(jid)
                         .timestamp(time)
+                        .maybe_action_timestamp(action_timestamp)
                         .action(Box::new(act.clone()))
                         .from_full_sync(event_full_sync)
                         .build(),
@@ -354,6 +369,7 @@ pub(crate) fn dispatch_chat_mutation_outcome(
                         .jid(jid)
                         .muted(act.muted.unwrap_or(false))
                         .timestamp(time)
+                        .maybe_action_timestamp(action_timestamp)
                         .action(Box::new(act))
                         .from_full_sync(event_full_sync)
                         .build(),
@@ -381,6 +397,7 @@ pub(crate) fn dispatch_chat_mutation_outcome(
                         .message_id(message_id)
                         .from_me(from_me)
                         .timestamp(time)
+                        .maybe_action_timestamp(action_timestamp)
                         .action(Box::new(act))
                         .from_full_sync(event_full_sync)
                         .build(),
@@ -1486,6 +1503,209 @@ mod registry_tests {
                 assert_eq!(u.action.locked, Some(true));
             }
             other => panic!("expected LockChatUpdate, got {other:?}"),
+        }
+    }
+
+    /// One mutation per kind `dispatch_chat_mutation_outcome` claims, plus a
+    /// contact removal, each stamped with `timestamp`.
+    fn every_chat_mutation(timestamp: Option<i64>) -> Vec<Mutation> {
+        use wa::sync_action_value as sav;
+        const CHAT: &str = "12025550111@s.whatsapp.net";
+        let set = |index: &[&str], value: wa::SyncActionValue| Mutation {
+            index: index.iter().map(|s| s.to_string()).collect(),
+            operation: wa::syncd_mutation::SyncdOperation::SET,
+            action_value: Some(wa::SyncActionValue { timestamp, ..value }),
+        };
+        let range = || buffa::MessageField::some(message_range(1_700_000_000_000, None, vec![]));
+        let message_key = ["120363000000000042@g.us", "MSGID", "0", CHAT];
+        vec![
+            set(
+                &["mute", CHAT],
+                wa::SyncActionValue {
+                    mute_action: buffa::MessageField::some(sav::MuteAction::default()),
+                    ..Default::default()
+                },
+            ),
+            set(
+                &["pin_v1", CHAT],
+                wa::SyncActionValue {
+                    pin_action: buffa::MessageField::some(sav::PinAction::default()),
+                    ..Default::default()
+                },
+            ),
+            set(
+                &["pin", CHAT],
+                wa::SyncActionValue {
+                    pin_action: buffa::MessageField::some(sav::PinAction::default()),
+                    ..Default::default()
+                },
+            ),
+            set(
+                &["archive", CHAT],
+                wa::SyncActionValue {
+                    archive_chat_action: buffa::MessageField::some(
+                        sav::ArchiveChatAction::default(),
+                    ),
+                    ..Default::default()
+                },
+            ),
+            set(
+                &[&["star"][..], &message_key].concat(),
+                wa::SyncActionValue {
+                    star_action: buffa::MessageField::some(sav::StarAction::default()),
+                    ..Default::default()
+                },
+            ),
+            set(
+                &["contact", CHAT],
+                wa::SyncActionValue {
+                    contact_action: buffa::MessageField::some(sav::ContactAction::default()),
+                    ..Default::default()
+                },
+            ),
+            Mutation {
+                operation: wa::syncd_mutation::SyncdOperation::REMOVE,
+                ..set(&["contact", CHAT], wa::SyncActionValue::default())
+            },
+            set(
+                &["markChatAsRead", CHAT],
+                wa::SyncActionValue {
+                    mark_chat_as_read_action: buffa::MessageField::some(
+                        sav::MarkChatAsReadAction::default(),
+                    ),
+                    ..Default::default()
+                },
+            ),
+            set(
+                &["mark_chat_as_read", CHAT],
+                wa::SyncActionValue {
+                    mark_chat_as_read_action: buffa::MessageField::some(
+                        sav::MarkChatAsReadAction::default(),
+                    ),
+                    ..Default::default()
+                },
+            ),
+            set(
+                &["deleteChat", CHAT, "1"],
+                wa::SyncActionValue {
+                    delete_chat_action: buffa::MessageField::some(sav::DeleteChatAction {
+                        message_range: range(),
+                    }),
+                    ..Default::default()
+                },
+            ),
+            set(
+                &["clearChat", CHAT, "0", "1"],
+                wa::SyncActionValue {
+                    clear_chat_action: buffa::MessageField::some(sav::ClearChatAction {
+                        message_range: range(),
+                    }),
+                    ..Default::default()
+                },
+            ),
+            set(
+                &["lock", CHAT],
+                wa::SyncActionValue {
+                    lock_chat_action: buffa::MessageField::some(sav::LockChatAction::default()),
+                    ..Default::default()
+                },
+            ),
+            set(
+                &["userStatusMute", CHAT],
+                wa::SyncActionValue {
+                    user_status_mute_action: buffa::MessageField::some(
+                        sav::UserStatusMuteAction::default(),
+                    ),
+                    ..Default::default()
+                },
+            ),
+            set(
+                &[&["deleteMessageForMe"][..], &message_key].concat(),
+                wa::SyncActionValue {
+                    delete_message_for_me_action: buffa::MessageField::some(
+                        sav::DeleteMessageForMeAction::default(),
+                    ),
+                    ..Default::default()
+                },
+            ),
+        ]
+    }
+
+    /// An event's name, `timestamp` and `action_timestamp`.
+    type Stamps = (
+        &'static str,
+        chrono::DateTime<chrono::Utc>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    );
+
+    /// The timestamps of every event the mutations dispatch.
+    fn dispatched_timestamps(timestamp: Option<i64>) -> Vec<Stamps> {
+        let mutations = every_chat_mutation(timestamp);
+        let stamps: Vec<_> = mutations
+            .iter()
+            .map(|m| {
+                let (outcome, events) = dispatch_outcome_into_recorder_with(m, true);
+                let AppStateDispatchOutcome::Event(name) = outcome else {
+                    panic!("{:?} dispatched no event: {outcome:?}", m.index);
+                };
+                let (t, a) = match &*events[0] {
+                    Event::MuteUpdate(u) => (u.timestamp, u.action_timestamp),
+                    Event::PinUpdate(u) => (u.timestamp, u.action_timestamp),
+                    Event::ArchiveUpdate(u) => (u.timestamp, u.action_timestamp),
+                    Event::StarUpdate(u) => (u.timestamp, u.action_timestamp),
+                    Event::ContactUpdate(u) => (u.timestamp, u.action_timestamp),
+                    Event::ContactRemoved(u) => (u.timestamp, u.action_timestamp),
+                    Event::MarkChatAsReadUpdate(u) => (u.timestamp, u.action_timestamp),
+                    Event::DeleteChatUpdate(u) => (u.timestamp, u.action_timestamp),
+                    Event::ClearChatUpdate(u) => (u.timestamp, u.action_timestamp),
+                    Event::LockChatUpdate(u) => (u.timestamp, u.action_timestamp),
+                    Event::UserStatusMuteUpdate(u) => (u.timestamp, u.action_timestamp),
+                    Event::DeleteMessageForMeUpdate(u) => (u.timestamp, u.action_timestamp),
+                    other => panic!("unexpected event {other:?}"),
+                };
+                (name, t, a)
+            })
+            .collect();
+        // Keyed on the dispatcher's own kinds, so a kind it starts claiming
+        // fails here until the table covers it.
+        let covered: std::collections::BTreeSet<_> =
+            mutations.iter().map(|m| m.index[0].as_str()).collect();
+        let claimed: std::collections::BTreeSet<_> = CHAT_ACTION_KINDS.iter().copied().collect();
+        assert_eq!(covered, claimed);
+        stamps
+    }
+
+    #[test]
+    fn a_carried_timestamp_reaches_every_chat_event() {
+        let sent = wacore::time::from_millis(1_700_000_000_123).expect("in range");
+        for (event, timestamp, action_timestamp) in dispatched_timestamps(Some(1_700_000_000_123)) {
+            assert_eq!(timestamp, sent, "{event}");
+            assert_eq!(action_timestamp, Some(sent), "{event}");
+        }
+    }
+
+    /// #1551: a replayed mutation whose value carries no timestamp. The
+    /// fallback in `timestamp` is kept for compatibility; `action_timestamp`
+    /// is what tells it apart from a mutation made at the epoch.
+    #[test]
+    fn a_missing_timestamp_is_absent_on_every_chat_event() {
+        for (event, timestamp, action_timestamp) in dispatched_timestamps(None) {
+            assert_eq!(timestamp, chrono::DateTime::UNIX_EPOCH, "{event}");
+            assert_eq!(action_timestamp, None, "{event}");
+        }
+    }
+
+    /// A timestamp `DateTime` cannot hold is no more an instant than a missing
+    /// one, whatever `timestamp` falls back to.
+    #[test]
+    fn an_out_of_range_timestamp_is_absent_on_every_chat_event() {
+        let before = wacore::time::now_utc();
+        for (event, timestamp, action_timestamp) in dispatched_timestamps(Some(i64::MAX)) {
+            assert!(
+                timestamp >= before,
+                "{event}: {timestamp} predates the dispatch"
+            );
+            assert_eq!(action_timestamp, None, "{event}");
         }
     }
 
