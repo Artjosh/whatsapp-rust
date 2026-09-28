@@ -837,17 +837,19 @@ impl<'a> Newsletter<'a> {
     ///
     /// `server_id` is the server-assigned ID of the message to react to.
     /// `reaction` is the emoji code (e.g., "👍", "❤️"), or empty to remove.
+    ///
+    /// Returns the stanza id. Match it against the `id` of the server's ack,
+    /// which arrives as [`wacore::types::events::Event::ServerAck`].
     pub async fn send_reaction(
         &self,
         jid: &Jid,
         server_id: u64,
         reaction: &str,
-    ) -> Result<(), NewsletterError> {
+    ) -> Result<String, NewsletterError> {
         self.client
             .send_server_reaction(jid, server_id, reaction)
             .await
-            .map_err(NewsletterError::from_anyhow)?;
-        Ok(())
+            .map_err(NewsletterError::from_anyhow)
     }
 
     /// Vote in a newsletter poll.
@@ -3375,6 +3377,28 @@ mod tests {
         assert_eq!(sent.tag.as_ref(), "message");
         let mut attrs = sent.attrs();
         assert_eq!(attrs.optional_string("id").unwrap(), id.as_str());
+        assert_eq!(attrs.optional_u64("server_id"), Some(777));
+        assert_eq!(attrs.jid("to"), jid);
+    }
+
+    /// Same contract as the vote: the reaction's ack is matched by this id.
+    #[tokio::test]
+    async fn send_reaction_returns_the_id_it_sent() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let jid = newsletter_jid();
+
+        let id = client
+            .newsletter()
+            .send_reaction(&jid, 777, "👍")
+            .await
+            .expect("reaction is sent");
+
+        let sent = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let sent = sent.get();
+        assert_eq!(sent.tag.as_ref(), "message");
+        let mut attrs = sent.attrs();
+        assert_eq!(attrs.optional_string("id").unwrap(), id.as_str());
+        assert_eq!(attrs.optional_string("type").unwrap(), "reaction");
         assert_eq!(attrs.optional_u64("server_id"), Some(777));
         assert_eq!(attrs.jid("to"), jid);
     }

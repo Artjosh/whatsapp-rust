@@ -352,7 +352,7 @@ impl Client {
         to: &Jid,
         server_id: u64,
         reaction: &str,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<String, anyhow::Error> {
         let request_id = self.generate_message_id();
 
         let stanza = NodeBuilder::new("message")
@@ -364,7 +364,7 @@ impl Client {
             .build();
 
         self.send_node(stanza).await?;
-        Ok(())
+        Ok(request_id)
     }
 
     /// Register a oneshot waiter for a server ack by message ID.
