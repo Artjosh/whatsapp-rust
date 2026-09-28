@@ -43,6 +43,9 @@ pub enum NewsletterError {
     /// message id, or a missing element in the server response).
     #[error("invalid newsletter request: {0}")]
     InvalidRequest(String),
+    /// No newsletter exists behind this JID.
+    #[error("newsletter not found: {0}")]
+    NotFound(Jid),
     /// Catch-all for internal failures with no dedicated variant.
     #[error("{0}")]
     Internal(#[from] anyhow::Error),
@@ -452,19 +455,13 @@ impl<'a> Newsletter<'a> {
             }))
             .await?;
 
-        let data = response
-            .data
-            .ok_or_else(|| NewsletterError::InvalidRequest("missing data".into()))?;
-        let newsletters = data["xwa2_newsletter_subscribed"]
-            .as_array()
-            .ok_or_else(|| {
-                NewsletterError::InvalidRequest("missing xwa2_newsletter_subscribed array".into())
-            })?;
-
-        newsletters.iter().map(parse_newsletter_metadata).collect()
+        parse_subscribed_newsletters(response.data)
     }
 
     /// Fetch metadata for a newsletter by its JID.
+    ///
+    /// Fails with [`NewsletterError::NotFound`] when no channel exists behind
+    /// `jid`.
     pub async fn get_metadata(&self, jid: &Jid) -> Result<NewsletterMetadata, NewsletterError> {
         let response = self
             .client
@@ -475,17 +472,7 @@ impl<'a> Newsletter<'a> {
             ))
             .await?;
 
-        let data = response
-            .data
-            .ok_or_else(|| NewsletterError::InvalidRequest("missing data".into()))?;
-        let newsletter = &data["xwa2_newsletter"];
-        if newsletter.is_null() {
-            return Err(NewsletterError::InvalidRequest(format!(
-                "newsletter not found: {}",
-                jid
-            )));
-        }
-        parse_newsletter_metadata(newsletter)
+        parse_fetched_newsletter(response.data, jid)
     }
 
     /// Create a new newsletter.
@@ -1207,6 +1194,53 @@ fn parse_json_u64(value: &serde_json::Value) -> Option<u64> {
         .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
 }
 
+/// A node that stands for no newsletter. The server answers a JID with no
+/// channel behind it with a node whose `id` is null (`state` `NON_EXISTING`),
+/// not with `null`; WA Web's `parseMexNewsletterResponse` keys on `id` too.
+fn is_absent_newsletter(value: &serde_json::Value) -> bool {
+    value.is_null() || value["id"].is_null()
+}
+
+fn parse_fetched_newsletter(
+    data: Option<serde_json::Value>,
+    jid: &Jid,
+) -> Result<NewsletterMetadata, NewsletterError> {
+    let data = data.ok_or_else(|| NewsletterError::InvalidRequest("missing data".into()))?;
+    let newsletter = data
+        .get("xwa2_newsletter")
+        .ok_or_else(|| NewsletterError::InvalidRequest("missing xwa2_newsletter".into()))?;
+    if is_absent_newsletter(newsletter) {
+        return Err(NewsletterError::NotFound(jid.clone()));
+    }
+    parse_newsletter_metadata(newsletter)
+}
+
+/// WA Web drops an absent entry and keeps the rest, so one bad entry does
+/// not cost the caller every other channel.
+fn parse_subscribed_newsletters(
+    data: Option<serde_json::Value>,
+) -> Result<Vec<NewsletterMetadata>, NewsletterError> {
+    let data = data.ok_or_else(|| NewsletterError::InvalidRequest("missing data".into()))?;
+    let newsletters = data["xwa2_newsletter_subscribed"]
+        .as_array()
+        .ok_or_else(|| {
+            NewsletterError::InvalidRequest("missing xwa2_newsletter_subscribed array".into())
+        })?;
+
+    let skipped = newsletters
+        .iter()
+        .filter(|node| is_absent_newsletter(node))
+        .count();
+    if skipped > 0 {
+        log::warn!("Skipping {skipped} subscribed newsletter entries without an id");
+    }
+    newsletters
+        .iter()
+        .filter(|node| !is_absent_newsletter(node))
+        .map(parse_newsletter_metadata)
+        .collect()
+}
+
 fn parse_newsletter_metadata(
     value: &serde_json::Value,
 ) -> Result<NewsletterMetadata, NewsletterError> {
@@ -1856,6 +1890,119 @@ mod tests {
                 metadata_with(None, None).verification,
                 NewsletterVerification::Unverified
             );
+        }
+    }
+
+    mod missing_newsletter {
+        use super::*;
+
+        /// What the server answers the metadata query with for a well-formed
+        /// JID that has no channel behind it: a node, not `null`.
+        fn non_existing_node() -> serde_json::Value {
+            json!({
+                "id": null,
+                "state": { "type": "NON_EXISTING" },
+                "thread_metadata": null,
+                "viewer_metadata": null
+            })
+        }
+
+        fn channel_node() -> serde_json::Value {
+            json!({
+                "id": "120363000000000001@newsletter",
+                "state": { "type": "ACTIVE" },
+                "thread_metadata": { "name": { "text": "x" } }
+            })
+        }
+
+        fn fetched(node: serde_json::Value) -> Option<serde_json::Value> {
+            Some(json!({ "xwa2_newsletter": node }))
+        }
+
+        fn subscribed(nodes: Vec<serde_json::Value>) -> Option<serde_json::Value> {
+            Some(json!({ "xwa2_newsletter_subscribed": nodes }))
+        }
+
+        #[test]
+        fn a_non_existing_answer_is_not_found() {
+            let result = parse_fetched_newsletter(fetched(non_existing_node()), &newsletter_jid());
+            assert!(matches!(
+                result,
+                Err(NewsletterError::NotFound(jid)) if jid == newsletter_jid()
+            ));
+        }
+
+        #[test]
+        fn a_null_answer_is_not_found() {
+            let result = parse_fetched_newsletter(fetched(json!(null)), &newsletter_jid());
+            assert!(matches!(
+                result,
+                Err(NewsletterError::NotFound(jid)) if jid == newsletter_jid()
+            ));
+        }
+
+        #[test]
+        fn a_channel_is_still_read() {
+            let metadata = parse_fetched_newsletter(fetched(channel_node()), &newsletter_jid())
+                .expect("metadata");
+            assert_eq!(metadata.jid, newsletter_jid());
+            assert_eq!(metadata.state, NewsletterState::Active);
+        }
+
+        #[test]
+        fn a_missing_data_block_is_still_a_malformed_answer() {
+            assert!(matches!(
+                parse_fetched_newsletter(None, &newsletter_jid()),
+                Err(NewsletterError::InvalidRequest(_))
+            ));
+            // An explicit `null` is an absent channel; an omitted field is not.
+            assert!(matches!(
+                parse_fetched_newsletter(Some(json!({})), &newsletter_jid()),
+                Err(NewsletterError::InvalidRequest(_))
+            ));
+            assert!(matches!(
+                parse_subscribed_newsletters(None),
+                Err(NewsletterError::InvalidRequest(_))
+            ));
+            assert!(matches!(
+                parse_subscribed_newsletters(Some(json!({}))),
+                Err(NewsletterError::InvalidRequest(_))
+            ));
+        }
+
+        /// WA Web drops such an entry and keeps the rest of the list.
+        #[test]
+        fn the_list_skips_an_entry_without_an_id() {
+            let mut without_id = channel_node();
+            without_id.as_object_mut().expect("object").remove("id");
+            let list = parse_subscribed_newsletters(subscribed(vec![
+                channel_node(),
+                without_id,
+                non_existing_node(),
+            ]))
+            .expect("list");
+            assert_eq!(list.len(), 1);
+            assert_eq!(list[0].jid, newsletter_jid());
+        }
+
+        #[test]
+        fn the_list_skips_a_null_entry() {
+            let list = parse_subscribed_newsletters(subscribed(vec![channel_node(), json!(null)]))
+                .expect("list");
+            assert_eq!(list.len(), 1);
+            assert_eq!(list[0].jid, newsletter_jid());
+        }
+
+        /// An id that is there but is not a JID is a malformed answer, not an
+        /// absent channel; it has never been observed.
+        #[test]
+        fn an_entry_with_an_unparseable_id_still_fails_the_list() {
+            let mut bad_id = channel_node();
+            bad_id["id"] = json!("not a jid");
+            assert!(matches!(
+                parse_subscribed_newsletters(subscribed(vec![channel_node(), bad_id])),
+                Err(NewsletterError::InvalidRequest(_))
+            ));
         }
     }
 
