@@ -407,8 +407,15 @@ impl Client {
 
     /// Create a new `Client` with default cache configuration.
     ///
-    /// This is the standard constructor. Use [`Client::new_with_cache_config`]
-    /// if you need to customise cache TTL / capacity.
+    /// Prefer [`Client::builder`] and [`ClientBuild::into_parts`](super::ClientBuild::into_parts)
+    /// for manual sync ownership, or `into_client()` for the default sync worker.
+    #[cfg_attr(
+        not(test),
+        deprecated(
+            since = "0.7.0",
+            note = "use Client::builder().build().await?.into_parts() or into_client()"
+        )
+    )]
     pub async fn new(
         runtime: Arc<dyn Runtime>,
         persistence_manager: Arc<PersistenceManager>,
@@ -429,6 +436,14 @@ impl Client {
     }
 
     /// Create a new `Client` with a custom [`CacheConfig`].
+    /// Prefer [`Client::builder`] with `with_cache_config`, then `into_parts()`.
+    #[cfg_attr(
+        not(test),
+        deprecated(
+            since = "0.7.0",
+            note = "use Client::builder().with_cache_config(...).build().await?.into_parts()"
+        )
+    )]
     pub async fn new_with_cache_config(
         runtime: Arc<dyn Runtime>,
         persistence_manager: Arc<PersistenceManager>,
