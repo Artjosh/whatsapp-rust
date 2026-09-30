@@ -16,7 +16,7 @@ struct OfflineHttp;
 #[async_trait::async_trait]
 impl HttpClient for OfflineHttp {
     async fn execute(&self, _: HttpRequest) -> anyhow::Result<HttpResponse> {
-        anyhow::bail!("a02 offline HTTP")
+        anyhow::bail!("offline lifecycle HTTP")
     }
 }
 struct OfflineTransport;
@@ -25,7 +25,7 @@ impl TransportFactory for OfflineTransport {
     async fn create_transport(
         &self,
     ) -> anyhow::Result<(Arc<dyn Transport>, async_channel::Receiver<TransportEvent>)> {
-        anyhow::bail!("a02 offline transport")
+        anyhow::bail!("offline lifecycle transport")
     }
 }
 async fn bot() -> Bot {
@@ -60,7 +60,7 @@ async fn client() -> Arc<Client> {
 }
 
 #[tokio::test]
-async fn a02_foreground_and_background_preserve_shutdown_reason() {
+async fn foreground_and_background_preserve_shutdown_reason() {
     let foreground = bot().await;
     let report = foreground.client().shutdown().await;
     assert_eq!(report.inbound, DrainOutcome::Completed);
@@ -90,7 +90,7 @@ async fn a02_foreground_and_background_preserve_shutdown_reason() {
 }
 
 #[tokio::test]
-async fn a02_background_preserves_auto_reconnect_failure() {
+async fn background_preserves_auto_reconnect_failure() {
     let foreground = bot().await;
     foreground
         .client()
@@ -116,7 +116,7 @@ async fn a02_background_preserves_auto_reconnect_failure() {
             } => {
                 let source = std::error::Error::source(&error).expect("connect source retained");
                 assert!(
-                    source.to_string().contains("a02 offline transport"),
+                    source.to_string().contains("offline lifecycle transport"),
                     "unexpected connect cause: {error:?}"
                 );
             }
@@ -126,7 +126,7 @@ async fn a02_background_preserves_auto_reconnect_failure() {
 }
 
 #[tokio::test]
-async fn a02_already_running_pause_and_sticky_shutdown_are_public() {
+async fn already_running_pause_and_sticky_shutdown_are_public() {
     let client = client().await;
     client.pause().await;
     let running = tokio::spawn({
@@ -167,7 +167,7 @@ async fn a02_already_running_pause_and_sticky_shutdown_are_public() {
 }
 
 #[tokio::test]
-async fn a02_background_already_running_is_observable() {
+async fn background_already_running_is_observable() {
     let bot = bot().await;
     let client = bot.client();
     client.pause().await;
@@ -194,7 +194,7 @@ async fn a02_background_already_running_is_observable() {
 }
 
 #[tokio::test]
-async fn a02_aborted_handle_returns_without_waiting_for_run_sender() {
+async fn aborted_handle_returns_without_waiting_for_run_sender() {
     let handle = bot().await.spawn();
     handle.abort();
     assert!(matches!(

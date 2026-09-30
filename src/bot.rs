@@ -2675,7 +2675,7 @@ mod tests {
         );
     }
 
-    fn a02_handle(
+    fn background_handle_for_test(
         client: Arc<Client>,
         done_rx: futures::channel::oneshot::Receiver<crate::RunCompletionReason>,
         abort_handle: wacore::runtime::AbortHandle,
@@ -2690,7 +2690,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a02_background_driver_preserves_actual_stopped_reason() {
+    async fn background_driver_preserves_actual_stopped_reason() {
         let bot = Bot::builder()
             .with_backend_arc(create_test_sqlite_backend().await)
             .with_transport_factory(TokioWebSocketTransportFactory::new())
@@ -2712,10 +2712,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a02_explicit_abort_does_not_wait_for_a_retained_sender() {
+    async fn explicit_abort_does_not_wait_for_a_retained_sender() {
         let client = crate::test_utils::create_test_client().await;
         let (_retained_sender, receiver) = futures::channel::oneshot::channel();
-        let handle = a02_handle(client, receiver, wacore::runtime::AbortHandle::noop());
+        let handle =
+            background_handle_for_test(client, receiver, wacore::runtime::AbortHandle::noop());
         handle.abort();
         assert!(matches!(
             tokio::time::timeout(std::time::Duration::from_secs(1), handle)
@@ -2726,20 +2727,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a02_lost_sender_is_unobserved_not_abort_or_panic() {
+    async fn lost_sender_is_unobserved_not_abort_or_panic() {
         let client = crate::test_utils::create_test_client().await;
         let (sender, receiver) = futures::channel::oneshot::channel();
         drop(sender);
-        let handle = a02_handle(client, receiver, wacore::runtime::AbortHandle::noop());
+        let handle =
+            background_handle_for_test(client, receiver, wacore::runtime::AbortHandle::noop());
         assert!(matches!(handle.await, BotRunOutcome::Unobserved));
     }
 
     #[tokio::test]
-    async fn a02_observed_run_exit_wins_over_late_abort() {
+    async fn observed_run_exit_wins_over_late_abort() {
         let client = crate::test_utils::create_test_client().await;
         let (sender, receiver) = futures::channel::oneshot::channel();
         sender.send(crate::RunCompletionReason::Stopped).unwrap();
-        let handle = a02_handle(client, receiver, wacore::runtime::AbortHandle::noop());
+        let handle =
+            background_handle_for_test(client, receiver, wacore::runtime::AbortHandle::noop());
         handle.abort();
         assert!(matches!(
             handle.await,
@@ -2748,12 +2751,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a02_drop_still_aborts_even_when_client_arc_is_retained() {
+    async fn drop_still_aborts_even_when_client_arc_is_retained() {
         let client = crate::test_utils::create_test_client().await;
         let (_sender, receiver) = futures::channel::oneshot::channel();
         let aborted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = aborted.clone();
-        let handle = a02_handle(
+        let handle = background_handle_for_test(
             client.clone(),
             receiver,
             wacore::runtime::AbortHandle::new(move || {

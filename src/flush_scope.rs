@@ -366,7 +366,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a02_runtime_drop_before_first_poll_releases_real_spawn_guard() {
+    async fn runtime_drop_before_first_poll_releases_real_spawn_guard() {
         let scope = Arc::new(FlushScope::new());
         scope.spawn(&DropBeforePollRuntime, futures::future::pending());
         assert_eq!(scope.pending(), 0);
@@ -377,7 +377,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a02_deadline_verdict_survives_later_completion() {
+    async fn deadline_verdict_survives_later_completion() {
         let scope = Arc::new(FlushScope::new());
         let guard = scope.try_track().unwrap();
         let verdict = scope.flush(&*rt(), Duration::ZERO).await;

@@ -3151,7 +3151,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a02_shutdown_report_preserves_device_and_signal_failure() {
+    async fn shutdown_report_preserves_device_and_signal_failure() {
         use crate::store::commands::DeviceCommand;
         use crate::store::error::StoreError;
         use whatsapp_rust_sqlite_storage::{SqliteStore, SqliteStoreConfig};
@@ -3159,7 +3159,7 @@ mod tests {
         let barrier_fail = fail.clone();
         // Same named shared-memory URI supported by create_test_backend.
         let database = format!(
-            "file:a02-lifecycle-{}?mode=memory&cache=shared",
+            "file:lifecycle-flush-{}?mode=memory&cache=shared",
             std::process::id()
         );
         let store = SqliteStore::with_config(
@@ -3169,7 +3169,7 @@ mod tests {
                 Box::pin(async move {
                     if fail.load(Ordering::Acquire) {
                         Err(StoreError::Io(std::io::Error::other(
-                            "a02 synthetic persistence failure",
+                            "synthetic persistence failure",
                         )))
                     } else {
                         Ok(())
@@ -3222,7 +3222,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a02_inbound_deadline_is_observed_in_shutdown_report() {
+    async fn inbound_deadline_is_observed_in_shutdown_report() {
         let client = crate::test_utils::create_test_client().await;
         client.swap_message_semaphore(1);
         let permit = client.acquire_message_processing_permit().await;
@@ -3237,7 +3237,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a02_socket_pairing_and_session_ready_are_distinct() {
+    async fn socket_pairing_and_session_ready_are_distinct() {
         let client = crate::test_utils::create_test_client().await;
         client.set_connected_for_test(true);
         client.is_logged_in.store(false, Ordering::Relaxed);
@@ -3268,7 +3268,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a02_canonical_run_preserves_stopped_and_pause_remains_reversible() {
+    async fn canonical_run_preserves_stopped_and_pause_remains_reversible() {
         let client = crate::test_utils::create_test_client().await;
         client.pause().await;
         assert!(client.is_paused());

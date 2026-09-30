@@ -1012,14 +1012,14 @@ mod tests {
     /// The production flush drains everything synchronously, covering the
     /// graceful-shutdown path where the detached drain is never awaited.
     #[tokio::test]
-    async fn a02_failed_secret_writes_remain_observable_after_buffer_empties() {
+    async fn failed_secret_writes_remain_observable_after_buffer_empties() {
         use crate::store::error::StoreError;
         use whatsapp_rust_sqlite_storage::{SqliteStore, SqliteStoreConfig};
         let fail = Arc::new(AtomicBool::new(false));
         let barrier_fail = fail.clone();
         // Same named shared-memory URI supported by create_test_backend.
         let database = format!(
-            "file:a02-secrets-{}?mode=memory&cache=shared",
+            "file:secret-write-failure-{}?mode=memory&cache=shared",
             std::process::id()
         );
         let store = SqliteStore::with_config(
@@ -1029,7 +1029,7 @@ mod tests {
                 Box::pin(async move {
                     if fail.load(Ordering::Acquire) {
                         Err(StoreError::Io(std::io::Error::other(
-                            "a02 synthetic secret write failure",
+                            "synthetic secret write failure",
                         )))
                     } else {
                         Ok(())
