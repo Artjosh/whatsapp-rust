@@ -284,6 +284,9 @@ async fn serve_noise_handshake(
 enum PeerBehavior {
     AnswerProbes,
     IgnoreEverything,
+    /// Sends `<success>` right after the handshake, as the server does, and
+    /// answers every request the login sets off.
+    LogInAndAnswerRequests,
 }
 
 async fn run_peer(
@@ -297,6 +300,12 @@ async fn run_peer(
     handshake_complete.send(()).await?;
     let mut incoming_counter = 0;
     let mut outgoing_counter = 0;
+    if matches!(behavior, PeerBehavior::LogInAndAnswerRequests) {
+        let success = wacore_binary::marshal::marshal(&NodeBuilder::new("success").build())?;
+        let encrypted = server_to_client.encrypt_with_counter(outgoing_counter, &success)?;
+        outgoing_counter += 1;
+        write_frame(&mut stream, &encrypted).await?;
+    }
     loop {
         let ciphertext =
             match tokio::time::timeout(Duration::from_secs(15), read_frame(&mut stream, false))
@@ -334,6 +343,13 @@ async fn run_peer(
         let should_answer = match behavior {
             PeerBehavior::AnswerProbes => xmlns == "w:p" || xmlns == "test:other",
             PeerBehavior::IgnoreEverything => false,
+            PeerBehavior::LogInAndAnswerRequests => {
+                node.get().tag.as_ref() == "iq"
+                    && matches!(
+                        node.get().attrs().optional_string("type").as_deref(),
+                        Some("get" | "set")
+                    )
+            }
         };
         if should_answer {
             let result = NodeBuilder::new("iq")
@@ -554,5 +570,64 @@ async fn loopback_tcp_silent_peer_reconnects_after_one_noise_ping() {
         "one ignored application IQ and one liveness probe"
     );
     assert_eq!(seen[1].1, "w:p");
+    peer.await.unwrap().unwrap();
+}
+
+/// The order production runs in, which a keepalive started by hand skips: the
+/// loop is spawned when the connection starts, and `<success>` arrives after
+/// it, through the read loop. Login moves the connection generation on, so a
+/// loop that only knows the pre-login one retires itself at its first tick and
+/// the logged-in connection is left with no idle ping.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn loopback_tcp_keepalive_pings_after_login() {
+    if isolate(concat!(
+        module_path!(),
+        "::loopback_tcp_keepalive_pings_after_login"
+    )) {
+        return;
+    }
+    let logs = log_capture::session();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (observed_tx, observed_rx) = async_channel::unbounded();
+    let (handshake_tx, handshake_rx) = async_channel::bounded(1);
+    let peer = tokio::spawn(run_peer(
+        listener,
+        PeerBehavior::LogInAndAnswerRequests,
+        observed_tx,
+        handshake_tx,
+    ));
+    let (client, _writes, _write_notify) = connected_client(address).await;
+    let reader = tokio::spawn(dial_and_read(client.clone()));
+    tokio::time::timeout(Duration::from_secs(5), handshake_rx.recv())
+        .await
+        .expect("the TCP peer completes the real Noise handshake")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !client.is_logged_in() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the client processes the peer's <success>");
+
+    // Ten real seconds are 100 on the client's clock: several keepalive ticks,
+    // enough for the login's own requests to settle and the link to go idle.
+    let pinged = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Ok((_, xmlns)) = observed_rx.recv().await {
+            if xmlns == "w:p" {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    assert!(
+        matches!(pinged, Ok(true)),
+        "a logged-in idle connection must be pinged; keepalive logs: {:?}",
+        logs.records_for("Client/Keepalive")
+    );
+    client.disconnect().await;
+    assert!(reader.await.unwrap().is_none());
     peer.await.unwrap().unwrap();
 }

@@ -1125,20 +1125,11 @@ impl Client {
         // `can_reach_server`, so a tick taken before anything reads is refused
         // as NotConnected, which the loop classifies as fatal and exits on,
         // leaving the connection with no idle ping and no dead-socket watchdog.
-        let keepalive = self.clone();
-        // Both captured here, in the caller, not inside the task: the spawn only
-        // promises the loop will run, not when its first poll happens, and by
-        // then a teardown may already have reset the notifier and bumped the
-        // generation for the next connection. See `keepalive_loop`.
-        let keepalive_shutdown = self.connection_shutdown_signal();
-        let keepalive_generation = self.connection_generation.load(Ordering::Acquire);
-        self.runtime
-            .spawn(Box::pin(async move {
-                keepalive
-                    .keepalive_loop(keepalive_shutdown, keepalive_generation)
-                    .await
-            }))
-            .detach();
+        //
+        // It only covers the connection until it logs in: `<success>` moves the
+        // generation on, which retires this loop, and starts the one that runs
+        // for the rest of the connection (see `handle_success`).
+        self.spawn_keepalive(self.connection_generation.load(Ordering::Acquire));
 
         let loop_result = self.read_messages_loop().await;
         // Consume intentional_reconnect on EVERY exit, reading it AFTER the loop

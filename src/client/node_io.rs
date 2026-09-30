@@ -1162,6 +1162,12 @@ impl Client {
         // window had every attempt rejected as retired.
         self.authenticated_generation
             .store(current_generation, Ordering::SeqCst);
+        // The keepalive `drive_connection_with_outcome` started is bound to the
+        // pre-login generation the increment above retired, so it exits at its
+        // next tick without pinging and this one takes over. Started once the
+        // generation is final, and from the read loop, which `<success>` never
+        // leaves, so the shutdown signal it subscribes is this connection's.
+        self.spawn_keepalive(current_generation);
         // Only now is there something worth waking for: released here and not at
         // `socket_ready_notifier`, which fires before login, so an IQ sent in
         // that gap is answered by nobody.
@@ -2470,13 +2476,26 @@ mod tests {
             .expect("client build")
             .into_client();
 
+        // `<success>` also starts the connection's keepalive, which is resident
+        // for the whole connection whichever path spawns it, so it is not what
+        // this budget is about. Sized through the same entry point, so it is
+        // told apart by size rather than by spawn order.
+        let before = sizes.lock().expect("sizes mutex").len();
+        client.spawn_keepalive(0);
+        let keepalive_size = sizes.lock().expect("sizes mutex")[before];
+
         // Only what `<success>` spawns: construction and `start_services` have
         // already recorded theirs.
         let before = sizes.lock().expect("sizes mutex").len();
         let success = NodeBuilder::new("success").build();
         client.handle_success(&success.as_node_ref()).await;
 
-        let spawned = sizes.lock().expect("sizes mutex")[before..].to_vec();
+        let mut spawned = sizes.lock().expect("sizes mutex")[before..].to_vec();
+        let keepalive = spawned
+            .iter()
+            .position(|&size| size == keepalive_size)
+            .expect("<success> must start the logged-in connection's keepalive");
+        spawned.swap_remove(keepalive);
         assert!(
             !spawned.is_empty(),
             "<success> must spawn the post-login task"

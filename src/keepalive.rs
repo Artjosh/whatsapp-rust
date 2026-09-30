@@ -201,6 +201,18 @@ impl Client {
         }
     }
 
+    /// Start the keepalive for the connection `generation` names.
+    ///
+    /// The shutdown signal is subscribed here, before the spawn, for the reason
+    /// [`keepalive_loop`](Self::keepalive_loop) takes it as an argument.
+    pub(crate) fn spawn_keepalive(self: &Arc<Self>, generation: u64) {
+        let shutdown_signal = self.connection_shutdown_signal();
+        let keepalive = self.clone();
+        self.runtime.spawn_detached(Box::pin(async move {
+            keepalive.keepalive_loop(shutdown_signal, generation).await
+        }));
+    }
+
     // Deliberately NOT instrumented: a span here would live for the whole
     // connection (tens of minutes), polluting duration/throughput metrics and
     // only reporting at disconnect. Per-ping visibility comes from
