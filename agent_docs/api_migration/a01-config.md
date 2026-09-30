@@ -108,9 +108,18 @@ warning (which requires migration for consumers denying warnings).
 `build()` starts ordinary client services, but not the major-sync consumer.
 `ClientBuild::into_client()` consumes the build and starts exactly one standard
 major-sync worker. `into_parts()` consumes the build and transfers the original,
-sole receiver **without** starting that worker; the host must drain it or pass it
-to `Client::start_sync_task_worker`. Do not clone it to create independent
-observers: async-channel receivers compete. Dropping the manual receiver closes
+sole receiver **without** starting that worker; the host must drain it and call
+`Client::process_sync_task` for each task. The internal worker-start helper is
+not public. A basic manual host loop is:
+
+```rust,ignore
+let (client, receiver) = build.into_parts();
+while let Ok(task) = receiver.recv().await {
+    client.process_sync_task(task).await;
+}
+```
+
+Do not clone it to create independent observers: async-channel receivers compete. Dropping the manual receiver closes
 this route. Bot retains its receiver until its existing launch path starts it.
 No Clone implementation or hidden receiver clone was added.
 
@@ -121,7 +130,12 @@ For the standard worker, replace the final `.into_parts()` above with
 
 `tests/api_a01_config.rs` uses only public APIs and an offline host backend,
 HTTP and transport. The standalone `tests/api-a01-consumer` package reuses it
-without workspace dependency aliases or default platform adapters:
+without workspace dependency aliases or default platform adapters.
+`tests/api_a01_consumer.rs` runs that standalone manifest (including its
+compile-fail doctest) through the existing integration-test CI gate, using a
+separate temporary target and clearing workspace codegen flags. It does not
+recursively include the runner. The same typestate assertion is also a
+`BotBuilder` doctest. To additionally verify against the actual MSRV locally:
 
 ```sh
 RUSTFLAGS='' CARGO_BUILD_JOBS=2 cargo +1.94.1 test \

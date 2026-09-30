@@ -55,9 +55,18 @@ impl ClientBuild {
 
     /// Transfer ownership of the client and its sole sync-task receiver.
     /// No major-sync worker is started on this path. The caller must drain the
-    /// receiver (or pass it to [`Client::start_sync_task_worker`]) for history
-    /// sync to keep working. Ordinary services already started by `build()` are
-    /// unaffected; this is not an inert-client constructor.
+    /// receiver and call [`Client::process_sync_task`] for history sync to keep
+    /// working. Ordinary services already started by `build()` are unaffected;
+    /// this is not an inert-client constructor.
+    ///
+    /// ```no_run
+    /// # async fn example(build: whatsapp_rust::ClientBuild) {
+    /// let (client, receiver) = build.into_parts();
+    /// while let Ok(task) = receiver.recv().await {
+    ///     client.process_sync_task(task).await;
+    /// }
+    /// # }
+    /// ```
     pub fn into_parts(self) -> (Arc<Client>, async_channel::Receiver<MajorSyncTask>) {
         (self.client, self.sync_task_receiver)
     }
@@ -236,6 +245,7 @@ impl ClientBuilder {
         &self.options
     }
 
+    /// Move a concrete runtime into this builder; use the Arc variant to share it.
     pub fn with_runtime<R>(mut self, runtime: R) -> Self
     where
         R: Runtime,
@@ -244,11 +254,13 @@ impl ClientBuilder {
         self
     }
 
+    /// Reuse an already-shared runtime without another Arc allocation.
     pub fn with_runtime_arc(mut self, runtime: Arc<dyn Runtime>) -> Self {
         self.runtime = Some(runtime);
         self
     }
 
+    /// Set the persistence manager for this session.
     pub fn with_persistence_manager(
         mut self,
         persistence_manager: Arc<PersistenceManager>,
@@ -257,6 +269,7 @@ impl ClientBuilder {
         self
     }
 
+    /// Move a concrete connection factory into this builder.
     pub fn with_transport_factory<T>(mut self, transport_factory: T) -> Self
     where
         T: TransportFactory + 'static,
@@ -265,6 +278,7 @@ impl ClientBuilder {
         self
     }
 
+    /// Reuse an already-shared connection factory.
     pub fn with_transport_factory_arc(
         mut self,
         transport_factory: Arc<dyn TransportFactory>,
@@ -273,6 +287,7 @@ impl ClientBuilder {
         self
     }
 
+    /// Move a concrete HTTP client into this builder, without requiring Clone.
     pub fn with_http_client<H>(mut self, http_client: H) -> Self
     where
         H: HttpClient + 'static,
@@ -281,6 +296,7 @@ impl ClientBuilder {
         self
     }
 
+    /// Reuse an already-shared HTTP client and its pool across sessions.
     pub fn with_http_client_arc(mut self, http_client: Arc<dyn HttpClient>) -> Self {
         self.http_client = Some(http_client);
         self
@@ -311,11 +327,13 @@ impl ClientBuilder {
         self
     }
 
+    /// Override automatic WhatsApp version selection.
     pub fn with_version_override(mut self, version: (u32, u32, u32)) -> Self {
         self.options.override_version = Some(version);
         self
     }
 
+    /// Replace cache/resource settings, preserving other shared options.
     pub fn with_cache_config(mut self, cache_config: CacheConfig) -> Self {
         self.options.cache_config = cache_config;
         self
@@ -379,6 +397,7 @@ impl ClientBuilder {
         self
     }
 
+    /// Acknowledge history-sync notifications without processing them when true.
     pub fn with_skip_history_sync(mut self, skip: bool) -> Self {
         self.options.skip_history_sync = skip;
         self
@@ -433,11 +452,13 @@ impl ClientBuilder {
         self
     }
 
+    /// Override the prekey batch size (clamped to protocol limits at upload).
     pub fn with_wanted_pre_key_count(mut self, count: usize) -> Self {
         self.options.wanted_pre_key_count = Some(count);
         self
     }
 
+    /// Override the outbound retry token bucket's burst and per-minute refill.
     pub fn with_resend_rate_limit(mut self, burst: u32, refill_per_min: u32) -> Self {
         self.options.resend_rate_limit = Some((burst, refill_per_min));
         self

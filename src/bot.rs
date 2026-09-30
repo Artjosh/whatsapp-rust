@@ -695,7 +695,13 @@ impl Bot {
 /// only available once all four are [`Provided`], turning missing-field errors
 /// into compile-time errors. With the default cargo features, transport, HTTP
 /// client and runtime start [`Provided`] (Tokio WebSocket, ureq, Tokio), so
-/// only the backend is required.
+/// only the backend is required. Shared options never satisfy required dependencies:
+///
+/// ```compile_fail
+/// use whatsapp_rust::bot::Bot;
+/// use whatsapp_rust::ClientOptions;
+/// let _ = Bot::builder().with_client_options(ClientOptions::default()).build();
+/// ```
 #[must_use = "call .build() to produce the Bot; the builder does nothing on its own"]
 pub struct BotBuilder<
     B = MissingBackend,
