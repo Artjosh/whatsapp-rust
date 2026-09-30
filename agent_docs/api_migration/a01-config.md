@@ -131,11 +131,12 @@ For the standard worker, replace the final `.into_parts()` above with
 `tests/api_a01_config.rs` uses only public APIs and an offline host backend,
 HTTP and transport. The standalone `tests/api-a01-consumer` package reuses it
 without workspace dependency aliases or default platform adapters.
-`tests/api_a01_consumer.rs` runs that standalone manifest (including its
-compile-fail doctest) through the existing integration-test CI gate, using a
-separate temporary target and clearing workspace codegen flags. It does not
-recursively include the runner. The same typestate assertion is also a
-`BotBuilder` doctest. To additionally verify against the actual MSRV locally:
+The four public tests run in the normal integration-test gate, and the typestate
+assertion also runs as a `BotBuilder` doctest. The standalone minimal-feature
+variant is currently an explicit local check: an additional MSRV CI step awaits
+authorized workflow ownership. It is deliberately not nested inside a nextest
+test, whose 180-second CI hang ceiling is shorter than a measured cold consumer
+build. No timeout budget was relaxed. To verify against the actual MSRV:
 
 ```sh
 RUSTFLAGS='' CARGO_BUILD_JOBS=2 cargo +1.94.1 test \
