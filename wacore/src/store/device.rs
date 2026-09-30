@@ -42,6 +42,54 @@ pub mod account_serde {
     }
 }
 
+/// Preserve the full syncd action, including lists and unknown enum values,
+/// without enabling generated-proto deserialization across the workspace.
+/// Invalid bytes and actions without a mode deserialize as absent optional
+/// state instead of rejecting the rest of the device record.
+pub mod status_privacy_serde {
+    use waproto::whatsapp::sync_action_value::StatusPrivacyAction;
+
+    #[derive(Debug, thiserror::Error)]
+    #[non_exhaustive]
+    pub enum DecodeError {
+        #[error("{0}")]
+        Protobuf(#[from] buffa::DecodeError),
+        #[error("status privacy action has no mode")]
+        MissingMode,
+    }
+
+    pub fn to_bytes(action: &StatusPrivacyAction) -> Vec<u8> {
+        waproto::codec::status_privacy_action_to_vec(action)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<StatusPrivacyAction, DecodeError> {
+        let action = waproto::codec::status_privacy_action_decode(bytes)?;
+        if action.mode.is_none() {
+            return Err(DecodeError::MissingMode);
+        }
+        Ok(action)
+    }
+
+    pub fn serialize<S: serde::Serializer>(
+        value: &Option<std::sync::Arc<StatusPrivacyAction>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(action) => serializer.serialize_some(&to_bytes(action)),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<std::sync::Arc<StatusPrivacyAction>>, D::Error> {
+        let bytes: Option<Vec<u8>> = serde::Deserialize::deserialize(deserializer)?;
+        Ok(bytes
+            .and_then(|bytes| from_bytes(&bytes).ok())
+            .map(std::sync::Arc::new))
+    }
+}
+
 pub mod key_pair_serde {
     use super::KeyPair;
     use crate::libsignal::protocol::{PrivateKey, PublicKey};
@@ -323,6 +371,11 @@ pub struct Device {
     /// This prevents stale history sync data from resurrecting a cleared salt.
     #[serde(skip)]
     pub nct_salt_sync_seen: bool,
+    /// Last authoritative status audience received from app-state sync. `None`
+    /// means unknown, not "all contacts". Keep the protobuf intact so newer
+    /// modes and custom lists are never silently widened to a default.
+    #[serde(with = "status_privacy_serde", default)]
+    pub status_privacy: Option<Arc<wa::sync_action_value::StatusPrivacyAction>>,
     /// Server cert chain cached from the last successful XX (or XX-fallback)
     /// handshake. Enables Noise IK on the next connect by exposing
     /// `leaf.key` as the server's static public key, and lets us reject
@@ -563,6 +616,7 @@ impl Device {
             server_has_prekeys: false,
             nct_salt: None,
             nct_salt_sync_seen: false,
+            status_privacy: None,
             server_cert_chain: None,
             login_counter: 0,
             lid_migrated: false,

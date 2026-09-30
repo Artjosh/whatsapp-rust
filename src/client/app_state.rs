@@ -818,10 +818,10 @@ impl Client {
     pub(crate) fn get_app_state_processor(&self) -> &Arc<AppStateProcessor> {
         self.app_state_processor.get_or_init(|| {
             debug!("Initializing AppStateProcessor for the first time.");
-            Arc::new(AppStateProcessor::new(
-                self.persistence_manager.backend(),
-                self.runtime.clone(),
-            ))
+            Arc::new(
+                AppStateProcessor::new(self.persistence_manager.backend(), self.runtime.clone())
+                    .with_mutation_persistence(self.persistence_manager.clone()),
+            )
         })
     }
 
@@ -2262,8 +2262,7 @@ impl Client {
                             target: "Client/AppState",
                             "Batched sync: apply failed for {name:?}: {e}"
                         );
-                        self.escalate_to_snapshot_recovery(name, &e).await;
-                        apply_error = Some(e);
+                        apply_error = Some((name, e));
                         break;
                     }
                 }
@@ -2435,8 +2434,13 @@ impl Client {
             // what the deferral buys is not a report but the dispatch itself:
             // mutations already persisted reach their consumer instead of being
             // stranded behind a cursor that has moved past them.
-            if let Some(e) = apply_error {
-                return Err(e);
+            if let Some((name, error)) = apply_error {
+                let full_sync = replaying_snapshot.contains(&name);
+                let error = self
+                    .dispatch_committed_mutations_from_error(error, full_sync, full_sync)
+                    .await;
+                self.escalate_to_snapshot_recovery(name, &error).await;
+                return Err(error);
             }
 
             pending = needs_refetch;
@@ -2608,13 +2612,16 @@ impl Client {
             let (mutations, new_state, list) =
                 match proc.process_parsed_patch_list(pl, &download, true).await {
                     Ok(applied) => applied,
-                    Err(e) => {
+                    Err(error) => {
                         // The single-collection path fails the same way the batched
                         // one does and deserves the same escalation; without it, a
                         // collection would recover only when its failure happened to
                         // arrive in a batch.
-                        self.escalate_to_snapshot_recovery(name, &e).await;
-                        return Err(e);
+                        let error = self
+                            .dispatch_committed_mutations_from_error(error, full_sync, full_sync)
+                            .await;
+                        self.escalate_to_snapshot_recovery(name, &error).await;
+                        return Err(error);
                     }
                 };
             let decode_elapsed = _decode_start.elapsed();
@@ -3218,6 +3225,7 @@ impl Client {
                     .cloned()
                     .ok_or_else(|| anyhow::anyhow!("external blob not pre-downloaded: {path}"))
             };
+            let replaying_snapshot = list.snapshot.is_some() || list.snapshot_ref.is_some();
             let proc = self.get_app_state_processor();
             match proc.process_parsed_patch_list(list, &download, true).await {
                 // The third element is the processor's own verdict, and it is
@@ -3240,7 +3248,6 @@ impl Client {
                     // `event_full_sync=false` (the base passed `false`
                     // here unconditionally), so the split args below must
                     // not be reunited into one `full_sync`.
-                    let replaying_snapshot = list.snapshot.is_some() || list.snapshot_ref.is_some();
                     let total = mutations.len();
                     for (position, mut m) in mutations.into_iter().enumerate() {
                         self.dispatch_app_state_mutation_inner(
@@ -3262,10 +3269,13 @@ impl Client {
                         true
                     }
                 }
-                Err(e) => {
+                Err(error) => {
+                    let error = self
+                        .dispatch_committed_mutations_from_error(error, false, replaying_snapshot)
+                        .await;
                     warn!(
                         target: "Client/AppState",
-                        "Failed to apply the patches {collection_name} conflicted with: {e:#}"
+                        "Failed to apply the patches {collection_name} conflicted with: {error:#}"
                     );
                     false
                 }
@@ -4308,6 +4318,31 @@ fn log_mutation_dispatched(
 }
 
 impl Client {
+    async fn dispatch_committed_mutations_from_error(
+        &self,
+        error: anyhow::Error,
+        event_full_sync: bool,
+        log_full_sync: bool,
+    ) -> anyhow::Error {
+        let committed = match error.downcast::<wacore::appstate_sync::CommittedMutationsError>() {
+            Ok(committed) => committed,
+            Err(error) => return error,
+        };
+        let (mutations, state, collection, source) = committed.into_parts();
+        wacore::telemetry::appstate_mutations(mutations.len() as u64);
+        let total = mutations.len();
+        for (position, mut mutation) in mutations.into_iter().enumerate() {
+            self.dispatch_app_state_mutation_inner(
+                &mut mutation,
+                event_full_sync,
+                log_full_sync,
+                Some((collection, state.version, position + 1, total)),
+            )
+            .await;
+        }
+        source
+    }
+
     /// Dispatch one app-state mutation, returning its [`AppStateDispatchOutcome`].
     ///
     /// `&mut` so a dispatcher can move the action out of the mutation into
@@ -4478,6 +4513,39 @@ impl Client {
         // All remaining mutations only care about Set operations
         if m.operation != wa::syncd_mutation::SyncdOperation::Set {
             return report("none", m, AppStateDispatchOutcome::Unclaimed, effect_detail);
+        }
+
+        // WA Web's WAWebStatusPrivacySettingSync (whatspec .wa-cache,
+        // 1N0AcCuvvZU.js, build 2.3000.1044770897) applies only a single
+        // Set with a present mode. Keep the full action rather than guessing
+        // an audience from the three legacy status_setting wire values.
+        if m.index.len() == 1 && m.index[0] == wacore::appstate::schemas::STATUS_PRIVACY.name {
+            let outcome = if wacore::appstate_sync::status_privacy_action(m).is_some() {
+                let action_timestamp = m
+                    .action_value
+                    .as_ref()
+                    .and_then(|v| v.timestamp)
+                    .and_then(chrono::DateTime::from_timestamp_millis);
+                let action = m
+                    .action_value
+                    .as_mut()
+                    .and_then(|v| v.status_privacy.take())
+                    .expect("validated status privacy action");
+                self.core.event_bus.dispatch(Event::StatusPrivacyUpdate(
+                    wacore::types::events::StatusPrivacyUpdate::builder()
+                        .timestamp(action_timestamp.unwrap_or_else(|| {
+                            wacore::time::from_millis_or_now(wacore::time::now_millis())
+                        }))
+                        .maybe_action_timestamp(action_timestamp)
+                        .action(Box::new(action))
+                        .from_full_sync(event_full_sync)
+                        .build(),
+                ));
+                AppStateDispatchOutcome::Event("StatusPrivacyUpdate")
+            } else {
+                AppStateDispatchOutcome::Malformed("StatusPrivacyUpdate")
+            };
+            return report("status_privacy", m, outcome, effect_detail);
         }
 
         // A call's direction is its creator compared against this account; the
@@ -8675,6 +8743,147 @@ mod critical_bootstrap_tests {
             client.needs_initial_full_sync.is_armed(),
             "and the replacement inherits the work through the gate"
         );
+    }
+
+    #[tokio::test]
+    async fn status_privacy_sync_persists_and_emits_full_action() {
+        use std::sync::{Arc, Mutex};
+        use wa::sync_action_value::status_privacy_action::{
+            CustomList, StatusDistributionMode as Mode,
+        };
+        use wacore::types::events::{Event, EventHandler, EventInterest};
+
+        struct Recorder(Mutex<Vec<Arc<Event>>>);
+        impl EventHandler for Recorder {
+            fn handle_event(&self, event: Arc<Event>) {
+                self.0.lock().expect("recorder mutex").push(event);
+            }
+            fn interest(&self) -> EventInterest {
+                EventInterest::ALL
+            }
+        }
+
+        let client = crate::test_utils::create_test_client_with_name("status_privacy_sync").await;
+        let recorder = Arc::new(Recorder(Mutex::new(Vec::new())));
+        let _subscription = client
+            .core
+            .event_bus
+            .subscribe_handler(Arc::clone(&recorder) as _);
+        assert!(client.status().audience().is_none());
+
+        let action = wa::sync_action_value::StatusPrivacyAction {
+            mode: Some(Mode::CUSTOM_LIST.into()),
+            user_jid: vec!["120363000000000042@lid".into()],
+            custom_lists: vec![CustomList {
+                list_id: Some("friends".into()),
+                name: Some("Friends".into()),
+                user_jid: vec!["120363000000000043@lid".into()],
+                is_selected: Some(true),
+                ..Default::default()
+            }],
+            modes: vec![Mode::CLOSE_FRIENDS.into(), Mode::CUSTOM_LIST.into()],
+            share_to_fb: Some(false),
+            share_to_ig: Some(true),
+        };
+        let make_mutation =
+            |action: wa::sync_action_value::StatusPrivacyAction| crate::appstate_sync::Mutation {
+                index: vec!["status_privacy".into()],
+                operation: wa::syncd_mutation::SyncdOperation::Set,
+                action_value: Some(wa::SyncActionValue {
+                    status_privacy: buffa::MessageField::some(action),
+                    timestamp: Some(1_700_000_000_000),
+                    ..Default::default()
+                }),
+            };
+        let mut mutation = make_mutation(action.clone());
+        client
+            .persistence_manager
+            .persist_status_privacy(&action)
+            .await
+            .unwrap();
+        let outcome = client
+            .dispatch_app_state_mutation(&mut mutation, true, (WAPatchName::RegularHigh, 7, 1, 1))
+            .await;
+        assert_eq!(
+            outcome,
+            AppStateDispatchOutcome::Event("StatusPrivacyUpdate")
+        );
+        assert_eq!(client.status().audience().as_deref(), Some(&action));
+        let held_audience = client.status().audience().expect("stored audience");
+        let memory = client.memory_report().await;
+        assert_eq!(memory.status_privacy.entries, 3);
+        assert!(memory.status_privacy.bytes > 0);
+        assert_eq!(
+            client.memory_report().await.status_privacy.bytes,
+            memory.status_privacy.bytes,
+            "sharing the audience must not count its payload twice"
+        );
+        drop(held_audience);
+        {
+            let events = recorder.0.lock().expect("recorder mutex");
+            assert_eq!(events.len(), 1);
+            match &*events[0] {
+                Event::StatusPrivacyUpdate(update) => {
+                    assert_eq!(update.action.as_ref(), &action);
+                    assert!(update.from_full_sync);
+                }
+                other => panic!("expected StatusPrivacyUpdate, got {other:?}"),
+            }
+        }
+
+        let unknown = waproto::codec::status_privacy_action_decode(&[0x08, 0x63])
+            .expect("decode unknown status privacy mode");
+        let mut unknown_mode = make_mutation(unknown.clone());
+        client
+            .persistence_manager
+            .persist_status_privacy(&unknown)
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .dispatch_app_state_mutation(
+                    &mut unknown_mode,
+                    false,
+                    (WAPatchName::RegularHigh, 8, 1, 1)
+                )
+                .await,
+            AppStateDispatchOutcome::Event("StatusPrivacyUpdate")
+        );
+        assert_eq!(
+            client.status().audience().as_deref(),
+            Some(&unknown),
+            "unknown mode must replace the previous allowed audience"
+        );
+        let unknown_memory = client.memory_report().await.status_privacy;
+        assert_eq!(unknown_memory.entries, 0);
+        assert!(unknown_memory.bytes > 0);
+        {
+            let events = recorder.0.lock().expect("recorder mutex");
+            assert_eq!(events.len(), 2);
+            match &*events[1] {
+                Event::StatusPrivacyUpdate(update) => {
+                    assert_eq!(update.action.as_ref(), &unknown);
+                }
+                other => panic!("expected StatusPrivacyUpdate, got {other:?}"),
+            }
+        }
+
+        let mut missing_mode = make_mutation(wa::sync_action_value::StatusPrivacyAction {
+            mode: None,
+            ..Default::default()
+        });
+        assert_eq!(
+            client
+                .dispatch_app_state_mutation(
+                    &mut missing_mode,
+                    false,
+                    (WAPatchName::RegularHigh, 9, 1, 1)
+                )
+                .await,
+            AppStateDispatchOutcome::Malformed("StatusPrivacyUpdate")
+        );
+        assert_eq!(client.status().audience().as_deref(), Some(&unknown));
+        assert_eq!(recorder.0.lock().expect("recorder mutex").len(), 2);
     }
 
     /// A 409 conflict absorb replays a snapshot's worth of mutations at TRACE

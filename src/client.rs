@@ -573,10 +573,10 @@ pub struct MemoryReport {
     pub history_payload_ids: u64,
     pub presence_subscriptions: usize,
     pub app_state_key_requests: usize,
-    /// Expanded app-state keys the processor holds in memory. No capacity cap
-    /// and no TTL — one entry per distinct key id the server's patches
-    /// reference, emptied only on reconnect. Zero until the first app-state
-    /// sync builds the processor.
+    /// Expanded app-state keys the processor holds in memory. Capped at 32
+    /// entries, with the oldest inserted key evicted first. The cache survives
+    /// reconnects and stays empty until the first app-state sync builds the
+    /// processor.
     pub app_state_key_cache: usize,
     /// Collections with an outstanding snapshot-recovery request.
     ///
@@ -584,6 +584,10 @@ pub struct MemoryReport {
     /// reply consumes the entry, so it is reported rather than assumed small.
     pub app_state_recovery_requests: usize,
     pub app_state_syncing: usize,
+    /// Synced audience retention. `entries` counts top-level JIDs, custom-list
+    /// records, and JIDs inside those lists. `bytes` attributes the shared
+    /// action allocation once.
+    pub status_privacy: CollectionStats,
     pub signal_sessions: CollectionStats,
     pub signal_identities: CollectionStats,
     pub signal_sender_keys: CollectionStats,
@@ -664,7 +668,7 @@ pub struct SubsystemMemory {
 impl MemoryReport {
     /// Common byte-carrying collections used by both totals and `Display`.
     /// Feature-specific collections stay beside their gated report section.
-    fn collections(&self) -> [(&'static str, &CollectionStats); 18] {
+    fn collections(&self) -> [(&'static str, &CollectionStats); 19] {
         [
             ("group_cache:", &self.group_cache),
             ("device_registry_cache:", &self.device_registry_cache),
@@ -684,6 +688,7 @@ impl MemoryReport {
             ("inbound_commit_batch:", &self.inbound_commit_batch),
             ("offline_receipts:", &self.offline_receipt_buffer),
             ("core_event_handlers:", &self.core_event_handlers),
+            ("status_privacy:", &self.status_privacy),
         ]
     }
 
@@ -760,6 +765,7 @@ impl MemoryReport {
                 n(self.app_state_recovery_requests),
             ),
             ("app_state_syncing", n(self.app_state_syncing)),
+            ("status_privacy", self.status_privacy.entries),
             ("signal_sessions", self.signal_sessions.entries),
             ("signal_identities", self.signal_identities.entries),
             ("signal_sender_keys", self.signal_sender_keys.entries),
@@ -877,6 +883,7 @@ impl std::fmt::Display for MemoryReport {
             self.app_state_recovery_requests
         )?;
         writeln!(f, "  app_state_syncing:      {}", self.app_state_syncing)?;
+        line(f, "status_privacy:", &self.status_privacy)?;
         writeln!(f, "--- Signal store caches ---")?;
         for (name, c) in &collections[LID_PN_END..LID_PN_END + SIGNAL_CACHES] {
             line(f, name, c)?;

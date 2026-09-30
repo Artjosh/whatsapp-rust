@@ -440,6 +440,34 @@ impl Client {
             history_sync_activity.tasks as u64,
             history_sync_activity.payload_bytes as u64,
         );
+        let device = self.persistence_manager.get_device_snapshot();
+        let status_privacy =
+            device
+                .status_privacy
+                .as_ref()
+                .map_or_else(CollectionStats::default, |action| {
+                    let entries = action
+                        .user_jid
+                        .len()
+                        .saturating_add(action.custom_lists.len())
+                        .saturating_add(
+                            action
+                                .custom_lists
+                                .iter()
+                                .map(|list| list.user_jid.len())
+                                .sum(),
+                        );
+                    CollectionStats::new(
+                        u64::try_from(entries).unwrap_or(u64::MAX),
+                        // Charge the retained Arc allocation even for a mode-only action.
+                        u64::try_from(
+                            size_of::<waproto::whatsapp::sync_action_value::StatusPrivacyAction>()
+                                .saturating_add(2 * size_of::<usize>())
+                                .saturating_add(action.heap_bytes()),
+                        )
+                        .unwrap_or(u64::MAX),
+                    )
+                });
         let subsystems = subsystem::memory(&self.subsystems);
         #[cfg(feature = "plugins")]
         let plugin_stats = self.plugin_stats();
@@ -541,6 +569,7 @@ impl Client {
             app_state_key_cache,
             app_state_recovery_requests,
             app_state_syncing,
+            status_privacy,
             signal_sessions,
             signal_identities,
             signal_sender_keys,
