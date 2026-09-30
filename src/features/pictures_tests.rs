@@ -1,9 +1,7 @@
 use super::*;
 use crate::ErrorChainExt;
 use crate::features::ContactError;
-use crate::test_utils::{
-    answer_iq, create_iq_test_client, decode_sent_iq, node_to_owned_ref, server_error_iq,
-};
+use crate::test_utils::{answer_iq, create_iq_test_client, decode_sent_iq, server_error_iq};
 use std::sync::Arc;
 use wacore_binary::{Node, NodeContent, OwnedNodeRef, builder::NodeBuilder};
 
@@ -48,18 +46,35 @@ async fn canonical_roundtrip(
     Result<ProfilePictureLookup, ContactError>,
     Arc<OwnedNodeRef>,
 ) {
+    canonical_roundtrip_route(response, existing_id, false).await
+}
+
+async fn canonical_roundtrip_route(
+    response: Node,
+    existing_id: Option<&'static str>,
+    community: bool,
+) -> (
+    Result<ProfilePictureLookup, ContactError>,
+    Arc<OwnedNodeRef>,
+) {
     let (client, transport) = create_iq_test_client().await;
     let task_client = client.clone();
     let task = tokio::spawn(async move {
-        let jid = Jid::pn("15550000001");
+        let jid = if community {
+            Jid::group("15550000001-7")
+        } else {
+            Jid::pn("15550000001")
+        };
+        let target = if community {
+            ProfilePictureTarget::Community(&jid)
+        } else {
+            ProfilePictureTarget::Contact(&jid)
+        };
         task_client
             .contacts()
             .lookup_picture(
-                ProfilePictureRequest::new(
-                    ProfilePictureTarget::Contact(&jid),
-                    ProfilePictureType::Preview,
-                )
-                .existing_id(existing_id),
+                ProfilePictureRequest::new(target, ProfilePictureType::Preview)
+                    .existing_id(existing_id),
             )
             .await
     });
@@ -481,29 +496,83 @@ async fn a05_conditional_consumer_fallback_keeps_original_and_omits_id_for_missi
     }
 }
 
-#[test]
-fn a05_community_nested_rate_limit_retains_original_response() {
-    let jid = Jid::group("15550000001-7");
-    let spec = ProfilePictureRequest::new(
-        ProfilePictureTarget::Community(&jid),
-        ProfilePictureType::Preview,
-    )
-    .spec(None);
-    let response = node_to_owned_ref(
-        &NodeBuilder::new("iq")
-            .attr("type", "result")
-            .children([NodeBuilder::new("pictures")
-                .children([refusal(429, true, Some(33))
-                    .get_optional_child("picture")
-                    .unwrap()
-                    .clone()])
-                .build()])
-            .build(),
-    );
-    let error = parse_preserving_rate_limit(&spec, &response).unwrap_err();
+#[tokio::test]
+async fn a05_community_nested_rate_limit_retains_original_response() {
+    let response = NodeBuilder::new("iq")
+        .attr("type", "result")
+        .children([NodeBuilder::new("pictures")
+            .children([refusal(429, true, Some(33))
+                .get_optional_child("picture")
+                .unwrap()
+                .clone()])
+            .build()])
+        .build();
+    let (result, original) = canonical_roundtrip_route(response, None, true).await;
+    let error = result.unwrap_err();
     assert_eq!(error.server_rejection().unwrap().backoff, Some(33));
-    let IqError::ServerError { response: kept, .. } = error else {
+    let ContactError::Iq(IqError::ServerError { response: kept, .. }) = error else {
         panic!("typed rejection")
     };
-    assert!(Arc::ptr_eq(kept.as_arc(), &response));
+    assert!(Arc::ptr_eq(kept.as_arc(), &original));
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("fixture decode failed")]
+struct FixtureParseError(Arc<()>);
+
+struct OrdinaryParseSpec {
+    marker: Arc<()>,
+    core_timeout: bool,
+}
+
+impl IqSpec for OrdinaryParseSpec {
+    type Response = ();
+
+    fn build_iq(&self) -> wacore::request::InfoQuery<'static> {
+        ProfilePictureSpec::preview(&Jid::pn("15550000001")).build_iq()
+    }
+
+    fn parse_response(&self, _: &wacore_binary::NodeRef<'_>) -> Result<(), anyhow::Error> {
+        if self.core_timeout {
+            Err(wacore::request::IqError::Timeout.into())
+        } else {
+            Err(anyhow::Error::new(FixtureParseError(self.marker.clone()))
+                .context("ordinary parser context"))
+        }
+    }
+}
+
+#[tokio::test]
+async fn a05_execute_leaves_ordinary_and_non_rejection_core_parse_errors_unchanged() {
+    for core_timeout in [false, true] {
+        let (client, transport) = create_iq_test_client().await;
+        let marker = Arc::new(());
+        let c = client.clone();
+        let spec = OrdinaryParseSpec {
+            marker: marker.clone(),
+            core_timeout,
+        };
+        let task = tokio::spawn(async move { c.execute(spec).await });
+        let sent = decode_sent_iq(&transport, 0).await;
+        answer_iq(
+            &client,
+            &sent.get().get_attr("id").unwrap().to_string(),
+            &NodeBuilder::new("iq").attr("type", "result").build(),
+        )
+        .await;
+        let error = task.await.unwrap().unwrap_err();
+        let IqError::ParseError(error) = error else {
+            panic!("only typed rejections may be lifted")
+        };
+        if core_timeout {
+            assert!(matches!(
+                error.downcast_ref::<wacore::request::IqError>(),
+                Some(wacore::request::IqError::Timeout)
+            ));
+        } else {
+            assert_eq!(error.to_string(), "ordinary parser context");
+            let original = error.downcast_ref::<FixtureParseError>().unwrap();
+            assert!(Arc::ptr_eq(&marker, &original.0));
+        }
+    }
 }

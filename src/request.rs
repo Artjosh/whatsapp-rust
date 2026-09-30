@@ -472,8 +472,25 @@ impl Client {
         };
 
         let response = self.execute_prepared(req_id, prepared).await?;
-        spec.parse_response(response.get())
-            .map_err(IqError::ParseError)
+        spec.parse_response(response.get()).map_err(|error| {
+            // A spec can report a typed rejection embedded in a result IQ.
+            // Attach its original response without changing ordinary parse errors.
+            match error.downcast_ref::<wacore::request::IqError>() {
+                Some(wacore::request::IqError::ServerError {
+                    code,
+                    text,
+                    error_type,
+                    backoff,
+                }) => IqError::ServerError {
+                    code: *code,
+                    text: text.clone(),
+                    error_type: error_type.clone(),
+                    backoff: *backoff,
+                    response: response.clone().into(),
+                },
+                _ => IqError::ParseError(error),
+            }
+        })
     }
 
     /// [`Client::execute`] for a spec whose response is consumed as it is

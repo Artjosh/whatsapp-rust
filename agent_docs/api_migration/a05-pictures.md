@@ -67,7 +67,10 @@ Canonical 429 is an error in the existing contact domain:
 `ContactError::Iq(IqError::ServerError { code, text, error_type, backoff, response })`.
 The original response allocation and all unread stanza metadata survive;
 `ErrorChainExt::server_rejection()` recovers the code and optional backoff through
-the source chain. Canonical lookup never emits an empty RateOverlimit, including
+the source chain. Canonical lookup uses `Client::execute` with a private preserving
+picture spec, retaining its encoding/correlation/timeout path. The execution
+layer attaches the response only to a concrete typed core IQ server rejection;
+ordinary parse errors (including non-rejection core errors) remain ParseError. Canonical lookup never emits an empty RateOverlimit, including
 embedded picture errors accepted by the existing Rust parser. Other operational
 failures remain errors. 401/403 map to NotAuthorized and 404 to NotFound.
 

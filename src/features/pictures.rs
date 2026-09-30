@@ -175,15 +175,25 @@ pub(crate) fn legacy_found(
     classify(result, false).map(ProfilePictureLookup::into_found)
 }
 
-pub(crate) fn parse_preserving_rate_limit(
-    spec: &ProfilePictureSpec,
-    response: &std::sync::Arc<wacore_binary::OwnedNodeRef>,
-) -> Result<ProfilePictureLookup, IqError> {
-    spec.parse_response_preserving_rate_limit(response.get())
-        .map_err(|error| match error.downcast::<wacore::request::IqError>() {
-            Ok(error) => IqError::from_response(error, response),
-            Err(error) => IqError::ParseError(error),
-        })
+struct PreservingPictureSpec(ProfilePictureSpec);
+
+impl IqSpec for PreservingPictureSpec {
+    type Response = ProfilePictureLookup;
+
+    fn build_iq(&self) -> wacore::request::InfoQuery<'static> {
+        self.0.build_iq()
+    }
+
+    fn encode_iq_direct(&self, request_id: &str, out: &mut Vec<u8>) -> Result<bool, anyhow::Error> {
+        self.0.encode_iq_direct(request_id, out)
+    }
+
+    fn parse_response(
+        &self,
+        response: &wacore_binary::NodeRef<'_>,
+    ) -> Result<Self::Response, anyhow::Error> {
+        self.0.parse_response_preserving_rate_limit(response)
+    }
 }
 
 pub(crate) async fn lookup(
@@ -199,10 +209,7 @@ pub(crate) async fn lookup(
     let result = if legacy_rate_limit {
         client.execute(spec).await
     } else {
-        match client.send_iq(spec.build_iq()).await {
-            Ok(response) => parse_preserving_rate_limit(&spec, &response),
-            Err(error) => Err(error),
-        }
+        client.execute(PreservingPictureSpec(spec)).await
     };
     classify(result, legacy_rate_limit)
 }

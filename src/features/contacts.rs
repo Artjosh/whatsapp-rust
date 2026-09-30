@@ -288,7 +288,7 @@ impl<'a> Contacts<'a> {
     /// Found/Unchanged/NotFound/NotAuthorized remain distinct. A 429 is an
     /// `IqError::ServerError` with its original stanza and backoff, never an empty
     /// `RateOverlimit`. There is no automatic community fallback. `into_found()`
-    /// discards all non-found states; Unchanged proves no local cached bytes.
+    /// discards all non-found states; Unchanged says nothing about cached bytes.
     pub async fn lookup_picture(
         &self,
         request: ProfilePictureRequest<'_>,
