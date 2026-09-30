@@ -9,7 +9,7 @@
 //! also WA Web behavior (the same pipeline with an immediate flush).
 
 use super::*;
-use portable_atomic::AtomicU64;
+use portable_atomic::{AtomicU64, AtomicUsize};
 use std::sync::atomic::Ordering;
 use wacore::store::traits::{PendingInboundKey, PendingInboundRow};
 use wacore::types::events::{BatchOrigin, InboundMessage, MessageBatch};
@@ -89,6 +89,9 @@ pub(crate) struct InboundCommitBatcher {
     /// commits use a local buffer instead: sharing it would serialize
     /// concurrent live-path hook calls that could previously overlap.
     arena: async_lock::Mutex<Vec<u8>>,
+    /// Last post-encode capacity, published before backend I/O so reports never
+    /// queue behind the arena lock. May lag growth during synchronous encoding.
+    arena_capacity: AtomicUsize,
 }
 
 impl Default for InboundCommitBatcher {
@@ -101,6 +104,7 @@ impl Default for InboundCommitBatcher {
             pending_live: std::sync::atomic::AtomicBool::new(false),
             epoch: AtomicU64::new(0),
             arena: async_lock::Mutex::new(Vec::new()),
+            arena_capacity: AtomicUsize::new(0),
             #[cfg(test)]
             fail_commits: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -151,23 +155,20 @@ impl InboundCommitBatcher {
     /// is a proxy for the decoded footprint, not a measurement of it — the
     /// decoded `wa::Message` graph is larger than its wire form.
     ///
-    /// Two exclusions, both deliberate:
-    ///
-    /// - **A batch inside its commit.** [`Self::take`] empties this state
-    ///   before `commit_inbound_batch` awaits the backend, the Signal flush and
-    ///   the durability hook, all of which still hold the messages. Counting
-    ///   them would mean re-encoding the batch to price it on the commit path —
-    ///   real work on the receive path to sharpen a report — so this reads
-    ///   "waiting to be committed", not "resident". `has_entries` draws the
-    ///   same line, for the same reason.
-    /// - **The reusable encode arena**, whose lock a drain commit holds across
-    ///   its backend write; a report must not queue behind one. Worth knowing
-    ///   that this hides real memory rather than a transient: the arena is
-    ///   cleared but not shrunk, so one oversized message leaves its capacity
-    ///   resident for the session.
+    /// A batch inside its commit is deliberately excluded: [`Self::take`]
+    /// empties this state before `commit_inbound_batch` awaits the backend,
+    /// Signal flush and durability hook, all of which still hold the messages.
+    /// Counting them would add work on the receive path to sharpen a report,
+    /// so this reads "waiting to be committed", not "resident". The reusable
+    /// encode arena is counted separately by [`Self::arena_capacity()`].
     pub(crate) fn pending_stats(&self) -> (usize, usize) {
         let state = self.lock();
         (state.entries.len(), state.bytes)
+    }
+
+    /// Retained shared encode-buffer bytes, without taking its commit lock.
+    pub(crate) fn arena_capacity(&self) -> usize {
+        self.arena_capacity.load(Ordering::Relaxed)
     }
 
     /// Switch to immediate (live) commits. Only the end-of-drain flush (or a
@@ -378,6 +379,7 @@ impl Client {
             state.entries.len() >= MAX_BATCH_MESSAGES || state.bytes >= MAX_BATCH_BYTES
         };
         if over {
+            let generation = self.connection_generation.load(Ordering::Acquire);
             let PendingInboundBatch {
                 entries,
                 commit_ticket,
@@ -388,7 +390,7 @@ impl Client {
             // A durable commit may be the retry that clears a deferred
             // drain→live transition (failed end-of-drain tail).
             if durable && self.inbound_commit_batch.live_transition_pending() {
-                self.complete_deferred_live_transition();
+                self.complete_deferred_live_transition(generation).await;
             }
         }
     }
@@ -436,6 +438,7 @@ impl Client {
             // permit; whatever accumulates now belongs to a newer timer.
             return true;
         }
+        let generation = self.connection_generation.load(Ordering::Acquire);
         let was_draining = self.inbound_commit_batch.is_active();
         let batch = self.inbound_commit_batch.take();
         let durable = if batch.is_empty() {
@@ -474,7 +477,7 @@ impl Client {
         }
         if deactivate {
             if durable {
-                self.inbound_commit_batch.deactivate();
+                self.deactivate_inbound_after_durable(generation).await;
             } else if was_draining {
                 // The guard restored the entries; switching to live mode now
                 // would let per-stanza full-cache flushes persist their
@@ -489,7 +492,7 @@ impl Client {
                 );
             }
         } else if durable && was_draining && self.inbound_commit_batch.live_transition_pending() {
-            self.complete_deferred_live_transition();
+            self.complete_deferred_live_transition(generation).await;
         }
         durable
     }
@@ -501,17 +504,34 @@ impl Client {
     /// persisted) only holds while stanzas are serialized. Called with the
     /// permit held and a durable commit just done, so the flip is as raceless
     /// as the normal end-of-drain one.
-    pub(crate) fn complete_deferred_live_transition(&self) {
-        // Receipts buffered during the deferred window (SKDM-only stanzas
-        // keep buffering while the batcher is active) are safe to send now:
-        // the durable flush that triggered this completion persisted their
-        // Signal state.
-        self.flush_offline_receipts();
-        self.inbound_commit_batch.deactivate();
+    pub(crate) async fn complete_deferred_live_transition(&self, generation: u64) {
+        if !self.deactivate_inbound_after_durable(generation).await {
+            return;
+        }
         self.swap_message_semaphore(64);
         // Key-share jobs may have observed the earlier failed transition.
         self.offline_sync_notifier.notify(usize::MAX);
         log::info!("Deferred drain-to-live transition completed after a durable flush");
+    }
+
+    /// Both durable transition paths retire the shared allocation before
+    /// publishing live mode. Failed commits, reset and forced exits keep it.
+    /// The processing permit normally makes this lock immediately ready; still
+    /// await it rather than discarding an active encoder if that changes, and
+    /// re-check the generation after the await so a reconnect keeps its arena.
+    async fn deactivate_inbound_after_durable(&self, generation: u64) -> bool {
+        let batcher = &self.inbound_commit_batch;
+        let mut arena = batcher.arena.lock().await;
+        if self.connection_generation.load(Ordering::Acquire) != generation {
+            return false;
+        }
+        *arena = Vec::new();
+        batcher.arena_capacity.store(0, Ordering::Relaxed);
+        // This includes receipts accumulated during a deferred transition:
+        // the successful row/Signal commit already made them safe to publish.
+        self.flush_offline_receipts();
+        batcher.deactivate();
+        true
     }
 
     /// Retry loop for a deferred transition, armed once at defer time: the
@@ -938,6 +958,11 @@ impl Client {
                             }),
                         );
                     }
+                }
+                if is_drain {
+                    self.inbound_commit_batch
+                        .arena_capacity
+                        .store(arena.capacity(), Ordering::Relaxed);
                 }
                 let rows: Vec<PendingInboundRow<'_>> = items
                     .iter()
@@ -1674,6 +1699,355 @@ mod tests {
                 .is_empty(),
             "a durable drain commit flushes the buffered offline receipts per snapshot"
         );
+    }
+
+    fn sized_item(id: &str, bytes: usize) -> InboundMessage {
+        let mut message = item(id);
+        message.message = Arc::new(wa::Message {
+            conversation: Some("x".repeat(bytes)),
+            ..Default::default()
+        });
+        message
+    }
+
+    // Two messages cross the byte trigger with one-message overshoot, rather
+    // than reserving a synthetic buffer that the persistence path never uses.
+    #[tokio::test]
+    async fn drain_arena_capacity_measurement() {
+        let client = create_test_client_with_failing_http("arena_measurement").await;
+        client.inbound_commit_batch.reset();
+        client.swap_message_semaphore(1);
+        let hook = Arc::new(RecordingHook {
+            batches: Mutex::new(Vec::new()),
+        });
+        let _ = client.inbound_durability_hook.set(hook.clone());
+
+        client
+            .commit_or_batch_inbound(sized_item("A1", 3 * 1024 * 1024), false)
+            .await;
+        client.maybe_flush_inbound_commits().await;
+        assert!(hook.batches.lock().unwrap().is_empty());
+        client
+            .commit_or_batch_inbound(sized_item("A2", 2 * 1024 * 1024), false)
+            .await;
+        let encoded_bytes = client.inbound_commit_batch.pending_stats().1;
+        assert!(encoded_bytes > MAX_BATCH_BYTES);
+        client.maybe_flush_inbound_commits().await;
+        let before = client.inbound_commit_batch.arena.lock().await.capacity();
+        assert!(before >= encoded_bytes);
+        assert!(client.inbound_commit_batch.is_active());
+        let rss_before = process_residency();
+        let generation = client.connection_generation.load(Ordering::Acquire);
+        assert!(client.finish_inbound_commit_drain(generation).await);
+        let after = client.inbound_commit_batch.arena.lock().await.capacity();
+        let rss_after = process_residency();
+        eprintln!(
+            "arena encoded={encoded_bytes} capacity_before={before} capacity_after={after}; residency_before={rss_before:?} residency_after={rss_after:?}"
+        );
+        assert_eq!(
+            after, 0,
+            "durable live transition must release the allocation"
+        );
+        let report = client.memory_report().await;
+        assert_eq!(report.inbound_commit_arena.bytes, 0);
+        assert_eq!(report.inbound_commit_arena.entries, 0);
+        assert_eq!(hook.batches.lock().unwrap().as_slice(), [vec!["A1", "A2"]]);
+        client
+            .commit_or_batch_inbound(sized_item("A3", 1024 * 1024), false)
+            .await;
+        assert_eq!(
+            client.inbound_commit_batch.arena_capacity(),
+            0,
+            "live commits must not regrow the shared arena"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_arena_survives_failed_transition_and_ordered_retry() {
+        for after_rows in [false, true] {
+            let client = create_test_client_with_failing_http("arena_retry").await;
+            client.inbound_commit_batch.reset();
+            client.swap_message_semaphore(1);
+            let hook = Arc::new(RecordingHook {
+                batches: Mutex::new(Vec::new()),
+            });
+            let _ = client.inbound_durability_hook.set(hook.clone());
+            client
+                .commit_or_batch_inbound(sized_item("P1", 3 * 1024 * 1024), false)
+                .await;
+            assert!(
+                client
+                    .flush_inbound_commits_under_permit(false, None, None)
+                    .await
+            );
+            let capacity = client.inbound_commit_batch.arena.lock().await.capacity();
+            assert!(capacity >= 3 * 1024 * 1024);
+
+            let ticket = match client
+                .commit_or_batch_inbound(sized_item("P2", 2 * 1024 * 1024), true)
+                .await
+            {
+                InboundCommitState::Deferred(Some(ticket)) => ticket,
+                _ => panic!("drain must defer the tracked commit"),
+            };
+            let failure = if after_rows {
+                &client.inbound_commit_batch.fail_flushes
+            } else {
+                &client.inbound_commit_batch.fail_commits
+            };
+            failure.store(true, Ordering::Release);
+            let generation = client.connection_generation.load(Ordering::Acquire);
+            assert!(!client.finish_inbound_commit_drain(generation).await);
+            assert_eq!(
+                client.inbound_commit_batch.arena.lock().await.capacity(),
+                capacity
+            );
+            assert!(client.inbound_commit_batch.is_active());
+            assert_eq!(
+                client.memory_report().await.inbound_commit_arena.bytes,
+                capacity as u64
+            );
+            assert_eq!(client.inbound_commit_batch.pending_stats().0, 1);
+            assert_eq!(ticket.state(), InboundCommitTicketState::Pending);
+            assert_eq!(available_permits(&client), 1);
+            assert_eq!(hook.batches.lock().unwrap().as_slice(), [vec!["P1"]]);
+            let backend = client.persistence_manager.backend();
+            assert_eq!(
+                backend
+                    .get_pending_inbound("100@g.us", "200@s.whatsapp.net", "P2")
+                    .await
+                    .unwrap()
+                    .is_some(),
+                after_rows,
+            );
+
+            failure.store(false, Ordering::Release);
+            client.commit_or_batch_inbound(item("P3"), false).await;
+            assert!(
+                client
+                    .flush_inbound_commits_under_permit(false, None, None)
+                    .await
+            );
+            assert_eq!(client.inbound_commit_batch.arena.lock().await.capacity(), 0);
+            assert!(!client.inbound_commit_batch.is_active());
+            assert_eq!(ticket.state(), InboundCommitTicketState::Durable);
+            assert_eq!(available_permits(&client), 64);
+            assert_eq!(
+                hook.batches.lock().unwrap().as_slice(),
+                [vec!["P1"], vec!["P2", "P3"]]
+            );
+            assert!(
+                backend
+                    .get_pending_inbound("100@g.us", "200@s.whatsapp.net", "P2")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    struct RejectingHook;
+
+    #[async_trait::async_trait]
+    impl InboundDurabilityHook for RejectingHook {
+        async fn on_messages(
+            &self,
+            _client: Arc<Client>,
+            _batch: &[InboundMessage],
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("test hook failure")
+        }
+    }
+
+    // Hook failure is still a durable transition: rows + Signal are committed
+    // and replay owns recovery, not the scratch encode buffer.
+    #[tokio::test]
+    async fn drain_arena_hook_failure_keeps_durable_replay_rows_not_scratch() {
+        let client = create_test_client_with_failing_http("arena_hook_failure").await;
+        client.inbound_commit_batch.reset();
+        client.swap_message_semaphore(1);
+        let _ = client.inbound_durability_hook.set(Arc::new(RejectingHook));
+        client
+            .commit_or_batch_inbound(sized_item("H1", 3 * 1024 * 1024), false)
+            .await;
+        let generation = client.connection_generation.load(Ordering::Acquire);
+        assert!(client.finish_inbound_commit_drain(generation).await);
+        assert!(!client.inbound_commit_batch.is_active());
+        assert_eq!(client.inbound_commit_batch.arena.lock().await.capacity(), 0);
+        assert!(
+            !client
+                .inbound_commit_batch
+                .publication_reached
+                .load(Ordering::Acquire)
+        );
+        let row = client
+            .persistence_manager
+            .backend()
+            .get_pending_inbound("100@g.us", "200@s.whatsapp.net", "H1")
+            .await
+            .unwrap()
+            .expect("hook replay must retain the durable row");
+        assert!(row.len() >= 3 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn drain_arena_without_hook_never_allocates_even_on_failed_transition() {
+        let client = create_test_client_with_failing_http("arena_no_hook").await;
+        client.inbound_commit_batch.reset();
+        client.swap_message_semaphore(1);
+        client
+            .commit_or_batch_inbound(sized_item("N1", 5 * 1024 * 1024), false)
+            .await;
+        client
+            .inbound_commit_batch
+            .fail_flushes
+            .store(true, Ordering::Release);
+        let generation = client.connection_generation.load(Ordering::Acquire);
+        assert!(!client.finish_inbound_commit_drain(generation).await);
+        assert!(client.inbound_commit_batch.has_entries());
+        assert_eq!(client.inbound_commit_batch.arena.lock().await.capacity(), 0);
+        assert_eq!(client.memory_report().await.inbound_commit_arena.bytes, 0);
+        client
+            .inbound_commit_batch
+            .fail_flushes
+            .store(false, Ordering::Release);
+        assert!(
+            client
+                .flush_inbound_commits_under_permit(false, None, None)
+                .await
+        );
+        assert!(!client.inbound_commit_batch.is_active());
+        assert_eq!(client.inbound_commit_batch.arena.lock().await.capacity(), 0);
+    }
+
+    #[tokio::test]
+    async fn drain_arena_report_does_not_wait_for_commit_lock() {
+        for reconnect in [false, true] {
+            let client = create_test_client_with_failing_http("arena_report_lock").await;
+            client.inbound_commit_batch.reset();
+            client.swap_message_semaphore(1);
+            let _ = client.inbound_durability_hook.set(Arc::new(RecordingHook {
+                batches: Mutex::new(Vec::new()),
+            }));
+            client
+                .commit_or_batch_inbound(sized_item("R1", 3 * 1024 * 1024), false)
+                .await;
+            assert!(
+                client
+                    .flush_inbound_commits_under_permit(false, None, None)
+                    .await
+            );
+            let arena = client.inbound_commit_batch.arena.lock().await;
+            let capacity = arena.capacity();
+            let generation = client.connection_generation.load(Ordering::Acquire);
+            let transition = client.finish_inbound_commit_drain(generation);
+            tokio::pin!(transition);
+            assert!(futures::poll!(&mut transition).is_pending());
+            assert!(client.inbound_commit_batch.is_active());
+            let report =
+                tokio::time::timeout(std::time::Duration::from_secs(1), client.memory_report())
+                    .await
+                    .expect("report must not queue behind the encode/backend lock");
+            assert_eq!(report.inbound_commit_arena.entries, 1);
+            assert_eq!(report.inbound_commit_arena.bytes, capacity as u64);
+            assert!(report.total_estimated_bytes() >= capacity as u64);
+            let display = report.to_string();
+            assert!(display.contains("inbound_commit_arena:"));
+            assert!(display.contains("inbound_commit_batch:"));
+
+            if reconnect {
+                client.connection_generation.fetch_add(1, Ordering::AcqRel);
+                client.inbound_commit_batch.reset();
+            }
+            drop(arena);
+            assert!(transition.await);
+            if reconnect {
+                assert!(
+                    client.inbound_commit_batch.is_active(),
+                    "stale release must not deactivate the replacement drain"
+                );
+                assert_eq!(
+                    client.inbound_commit_batch.arena.lock().await.capacity(),
+                    capacity
+                );
+                let generation = client.connection_generation.load(Ordering::Acquire);
+                assert!(client.finish_inbound_commit_drain(generation).await);
+            }
+            assert!(!client.inbound_commit_batch.is_active());
+            assert_eq!(client.inbound_commit_batch.arena.lock().await.capacity(), 0);
+        }
+    }
+
+    struct BlockingHook {
+        entered: async_channel::Sender<()>,
+    }
+
+    #[async_trait::async_trait]
+    impl InboundDurabilityHook for BlockingHook {
+        async fn on_messages(
+            &self,
+            _client: Arc<Client>,
+            _batch: &[InboundMessage],
+        ) -> anyhow::Result<()> {
+            self.entered.send(()).await.expect("hook entered receiver");
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_arena_cancelled_hook_keeps_active_buffer_and_durable_rows() {
+        let client = create_test_client_with_failing_http("arena_hook_cancel").await;
+        client.inbound_commit_batch.reset();
+        client.swap_message_semaphore(1);
+        let (entered, rx) = async_channel::bounded(1);
+        let _ = client
+            .inbound_durability_hook
+            .set(Arc::new(BlockingHook { entered }));
+        client
+            .commit_or_batch_inbound(sized_item("C1", 3 * 1024 * 1024), false)
+            .await;
+        let generation = client.connection_generation.load(Ordering::Acquire);
+        {
+            let transition = client.finish_inbound_commit_drain(generation);
+            tokio::pin!(transition);
+            tokio::select! {
+                durable = &mut transition => panic!("blocking hook unexpectedly returned: {durable}"),
+                entered = rx.recv() => entered.expect("hook must be reached"),
+            }
+            assert!(client.inbound_commit_batch.is_active());
+            assert!(client.inbound_commit_batch.arena.lock().await.capacity() >= 3 * 1024 * 1024);
+            // Scope exit cancels the finisher after its durable row/Signal point.
+        }
+        assert!(client.inbound_commit_batch.is_active());
+        assert!(!client.inbound_commit_batch.has_entries());
+        let backend = client.persistence_manager.backend();
+        assert!(
+            backend
+                .get_pending_inbound("100@g.us", "200@s.whatsapp.net", "C1")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(client.finish_inbound_commit_drain(generation).await);
+        assert_eq!(client.inbound_commit_batch.arena.lock().await.capacity(), 0);
+        assert!(
+            backend
+                .get_pending_inbound("100@g.us", "200@s.whatsapp.net", "C1")
+                .await
+                .unwrap()
+                .is_some(),
+            "releasing scratch must not delete replay data"
+        );
+    }
+
+    // Diagnostic only: allocator/page retention is not a capacity assertion.
+    fn process_residency() -> Vec<String> {
+        std::fs::read_to_string("/proc/self/status")
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.starts_with("VmRSS:") || line.starts_with("RssAnon:"))
+            .map(str::to_owned)
+            .collect()
     }
 
     fn available_permits(client: &Client) -> usize {

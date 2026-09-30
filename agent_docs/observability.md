@@ -936,12 +936,16 @@ the bound is a drain or a lifecycle, so the count is the only warning available.
   drop acks the server is waiting for.
 - **`offline_receipt_buffer`** — drained at the end of every offline batch.
   `memory_report()` counts its depth and the retained `MessageInfo` allocations.
-- **The drain commit's encode arena** — the only unreported entry, and the only
-  item on this list that is not a collection: a `Vec<u8>` reused across drain
-  commits. `commit_inbound_batch` clears it but keeps its capacity, so one
-  oversized message leaves that capacity resident for the rest of the session.
-  Unreported because sampling it means taking a lock a commit holds across its
-  backend write. Sizing it is a shrink-after-use question, not a cap question.
+- **The drain commit's encode arena** — a `Vec<u8>` reused across drain
+  commits while batching is active, including failed commits and retries. Its
+  allocation is released only at a successful durable drain-to-live transition;
+  live commits use local buffers instead. `inbound_commit_arena` reports its
+  capacity separately from the waiting messages' encoded-byte proxy. A relaxed
+  atomic snapshot is published after encoding, before backend I/O, so reporting
+  never waits for the arena lock held across that write. During encoding the
+  snapshot can lag growth; local live buffers remain outside this report.
+  Capacity is retained heap, not RSS: freeing it does not promise that the
+  allocator returns pages to the OS.
 
 Two design rules the audit confirmed, and one place where the second does not
 hold as tightly as the code comments suggest:
