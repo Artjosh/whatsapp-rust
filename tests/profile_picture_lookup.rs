@@ -27,7 +27,7 @@ fn boxed_lookup<'a>(
 }
 
 #[test]
-fn a05_public_imports_and_boxed_future_compile() {
+fn picture_lookup_public_imports_and_boxed_future_compile() {
     let _ = boxed_lookup;
     let jid = Jid::pn("15550000001");
     let request: FeatureRequest<'_> = ProfilePictureRequest::new(
@@ -38,7 +38,7 @@ fn a05_public_imports_and_boxed_future_compile() {
 }
 
 #[test]
-fn a05_into_found_explicitly_discards_non_found_states() {
+fn picture_lookup_into_found_explicitly_discards_non_found_states() {
     for outcome in [
         ProfilePictureLookup::Unchanged,
         ProfilePictureLookup::NotFound,

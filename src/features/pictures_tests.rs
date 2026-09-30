@@ -91,7 +91,7 @@ async fn canonical_roundtrip_route(
 }
 
 #[tokio::test]
-async fn a05_found_unchanged_absent_and_unauthorized_roundtrip() {
+async fn picture_lookup_found_unchanged_absent_and_unauthorized_roundtrip() {
     let (found, _) = canonical_roundtrip(found_response(), None).await;
     let picture = found.unwrap().into_found().unwrap();
     assert_eq!(picture.id, "photo-7");
@@ -128,7 +128,7 @@ async fn a05_found_unchanged_absent_and_unauthorized_roundtrip() {
 }
 
 #[tokio::test]
-async fn a05_rate_limit_keeps_source_original_stanza_and_optional_backoff() {
+async fn picture_lookup_rate_limit_keeps_source_original_stanza_and_optional_backoff() {
     for nested in [false, true] {
         for backoff in [None, Some(73)] {
             let (result, original) = canonical_roundtrip(refusal(429, nested, backoff), None).await;
@@ -161,7 +161,7 @@ async fn a05_rate_limit_keeps_source_original_stanza_and_optional_backoff() {
 }
 
 #[tokio::test]
-async fn a05_legacy_getter_and_lookups_keep_their_distinct_429_behavior() {
+async fn picture_lookup_legacy_getter_and_lookups_keep_their_distinct_429_behavior() {
     // Exercise the actual facade wrappers, not just their result mapper.
     for wrapper in 0..5 {
         for nested in [false, true] {
@@ -240,7 +240,7 @@ async fn a05_legacy_getter_and_lookups_keep_their_distinct_429_behavior() {
 }
 
 #[test]
-fn a05_request_wire_size_route_timeout_and_advanced_options() {
+fn picture_lookup_request_wire_size_route_timeout_and_advanced_options() {
     let jid = Jid::group("15550000001-7");
     let shared = Jid::group("15550000001-8");
     for size in [ProfilePictureType::Preview, ProfilePictureType::Full] {
@@ -314,7 +314,7 @@ fn a05_request_wire_size_route_timeout_and_advanced_options() {
 }
 
 #[test]
-fn a05_special_jids_do_not_discover_privacy_tokens() {
+fn picture_lookup_special_jids_do_not_discover_privacy_tokens() {
     let pn = Jid::pn("15550000001");
     assert!(token_eligible(ProfilePictureTarget::Contact(&pn), false));
     assert!(!token_eligible(ProfilePictureTarget::Contact(&pn), true));
@@ -336,7 +336,7 @@ fn a05_special_jids_do_not_discover_privacy_tokens() {
 }
 
 #[tokio::test]
-async fn a05_psa_is_short_circuited_and_timeout_remains_an_error() {
+async fn picture_lookup_psa_is_short_circuited_and_timeout_remains_an_error() {
     let (client, transport) = create_iq_test_client().await;
     let psa = Jid::pn("0");
     let request = ProfilePictureRequest::new(
@@ -417,7 +417,8 @@ async fn consumer_lookup(
 }
 
 #[tokio::test]
-async fn a05_conditional_consumer_fallback_keeps_original_and_omits_id_for_missing_bytes() {
+async fn picture_lookup_conditional_consumer_fallback_keeps_original_and_omits_id_for_missing_bytes()
+ {
     for need_bytes in [true, false] {
         for fallback_response in [
             found_response(),
@@ -497,7 +498,7 @@ async fn a05_conditional_consumer_fallback_keeps_original_and_omits_id_for_missi
 }
 
 #[tokio::test]
-async fn a05_community_nested_rate_limit_retains_original_response() {
+async fn picture_lookup_community_nested_rate_limit_retains_original_response() {
     let response = NodeBuilder::new("iq")
         .attr("type", "result")
         .children([NodeBuilder::new("pictures")
@@ -543,7 +544,7 @@ impl IqSpec for OrdinaryParseSpec {
 }
 
 #[tokio::test]
-async fn a05_execute_leaves_ordinary_and_non_rejection_core_parse_errors_unchanged() {
+async fn picture_lookup_execute_leaves_ordinary_and_non_rejection_core_parse_errors_unchanged() {
     for core_timeout in [false, true] {
         let (client, transport) = create_iq_test_client().await;
         let marker = Arc::new(());
