@@ -231,8 +231,8 @@ pub use client::{
 #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
 pub use client::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
 pub use client::{
-    ConnectError, ConnectStage, ProtocolTerminalReason, Reachability, RunCompletionReason,
-    SignalMaintenanceError,
+    ConnectError, ConnectStage, DrainOutcome, ProtocolTerminalReason, Reachability,
+    RunCompletionReason, SecretFlushReport, ShutdownReport, SignalMaintenanceError,
 };
 pub use types::durability_hook::InboundDurabilityHook;
 pub use types::history_sync_admission::{
@@ -357,6 +357,7 @@ pub use features::{
 };
 
 pub mod bot;
+pub use bot::{BotRunOutcome, BotShutdownReport};
 pub mod lid_pn_cache;
 #[cfg(feature = "signal")]
 pub mod shutdown;
@@ -370,6 +371,7 @@ pub mod version;
 /// `use whatsapp_rust::prelude::*;`.
 pub mod prelude {
     pub use crate::bot::{Bot, BotBuilder, BotHandle, EventDelivery, MessageContext};
+    pub use crate::bot::{BotRunOutcome, BotShutdownReport};
     pub use crate::client::{
         Client, ClientBuilder, ClientBuilderError, ClientError, ClientOptions, Connection,
         DecryptedPayloadLease, EncDecryptFailedLease, RawNodeLease, SentFrameLease,
@@ -378,7 +380,8 @@ pub mod prelude {
     #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
     pub use crate::client::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
     pub use crate::client::{
-        ConnectError, ConnectStage, ProtocolTerminalReason, RunCompletionReason,
+        ConnectError, ConnectStage, DrainOutcome, ProtocolTerminalReason, RunCompletionReason,
+        SecretFlushReport, ShutdownReport,
     };
     #[cfg(feature = "plugins")]
     #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
