@@ -164,7 +164,7 @@ enum Delivery {
 /// Terminal Client shutdown also cancels pending/in-flight callbacks, without
 /// joining or draining them. Cancellation is cooperative at future poll boundaries;
 /// blocking synchronous callbacks and external tasks/Client clones are host-owned.
-/// Workers hold only Weak<Client> while idle, upgrading for each callback.
+/// Workers hold only `Weak<Client>` while idle, upgrading for each callback.
 ///
 /// Raw EventHandler implementations still run synchronously on the dispatch path
 /// and must not block. Plugin envelopes remain a separate API.

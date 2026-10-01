@@ -6431,6 +6431,103 @@ async fn slow_callback_does_not_hold_chatstate_protocol_dispatch() {
     .await;
 }
 
+/// Exercise encrypted transport frames and the central reader, not just direct
+/// bus dispatch. A parked observer must not delay an unrelated IQ response.
+#[tokio::test]
+async fn central_reader_resolves_iq_while_event_callback_is_pending() {
+    use crate::bot::{CallbackEventHandler, EventDelivery};
+    use crate::transport::TransportEvent;
+    use wacore::handshake::NoiseCipher;
+    use wacore::net::DisconnectReason;
+    use wacore::types::events::{EventInterest, EventKind};
+
+    let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+    let (tx, receiver) = async_channel::bounded(8);
+    *client.transport_events.lock().await = Some(receiver);
+    let (entered_tx, entered_rx) = async_channel::bounded(1);
+    let callback = CallbackEventHandler::from_callback(
+        &client,
+        EventInterest::of(&[EventKind::ChatPresence]),
+        EventDelivery::Ordered { capacity: 1 },
+        move |_, _| {
+            let entered = entered_tx.clone();
+            async move {
+                entered.send(()).await.unwrap();
+                std::future::pending::<()>().await;
+            }
+        },
+    );
+    let _subscription = client.subscribe_handler(callback.clone());
+    let reader_client = client.clone();
+    let reader = tokio::spawn(async move {
+        reader_client
+            .connection_for_test()
+            .read_until_disconnected()
+            .await;
+    });
+    let cipher = NoiseCipher::new(&[0u8; 32]).unwrap();
+    let frame = |node: Node, counter| {
+        let mut packed = wacore_binary::marshal::marshal(&node).unwrap();
+        cipher
+            .encrypt_in_place_with_counter(counter, &mut packed)
+            .unwrap();
+        TransportEvent::DataReceived(wacore::framing::encode_frame(&packed, None).unwrap().into())
+    };
+    let chatstate = || {
+        NodeBuilder::new("chatstate")
+            .attr("from", "15550002222@s.whatsapp.net")
+            .children([NodeBuilder::new("composing").build()])
+            .build()
+    };
+    tx.send(frame(chatstate(), 0)).await.unwrap();
+    entered_rx.recv().await.unwrap(); // Trigger: callback has reached Pending.
+    // Saturate the observer mailbox. These frames still reach the reader/handler.
+    for counter in 1..4 {
+        tx.send(frame(chatstate(), counter)).await.unwrap();
+    }
+    let (response_tx, response_rx) = oneshot::channel();
+    assert!(
+        client
+            .response_waiters_guard()
+            .try_insert_guarded(
+                "observer-progress".to_string(),
+                ResponseWaiter::Iq(response_tx),
+            )
+            .is_some()
+    );
+    tx.send(frame(
+        NodeBuilder::new("iq")
+            .attr("from", "s.whatsapp.net")
+            .attr("id", "observer-progress")
+            .attr("type", "result")
+            .build(),
+        4,
+    ))
+    .await
+    .unwrap();
+    // Falsifier: this cannot complete if callback delivery blocks the reader.
+    let response = tokio::time::timeout(Duration::from_secs(5), response_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.tag(), "iq");
+    assert_eq!(callback.stats().callbacks_active, 1);
+    assert_eq!(callback.stats().dropped_full, 2);
+    assert_eq!(client.stats().events_dropped, 2);
+    tx.send(TransportEvent::Disconnected(DisconnectReason::StreamEnded))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), reader)
+        .await
+        .unwrap()
+        .unwrap();
+    client.shutdown().await;
+    crate::test_utils::poll_until("observer released after reader exit", || {
+        callback.stats().callbacks_active == 0
+    })
+    .await;
+}
+
 // --- stanza interceptors ---------------------------------------------------
 
 use crate::client::interceptor::{Interception, StanzaInterceptor};
