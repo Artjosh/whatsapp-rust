@@ -255,17 +255,14 @@ impl CallbackEventHandler {
                                 let cancel = wait_for_shutdown(&cancelled).fuse();
                                 let terminal = wait_for_shutdown(&shutdown).fuse();
                                 futures::pin_mut!(receive, cancel, terminal);
-                                let mut queued = futures::select_biased! {
+                                let queued = futures::select_biased! {
                                     _ = cancel => break,
                                     _ = terminal => break,
                                     result = receive => match result { Ok(event) => event, Err(_) => break },
                                 };
                                 if cancelled.is_fired() || shutdown.is_fired() { break; }
-                                let Some(event) = queued.event.take() else { continue; };
-                                for handler in handlers.iter().filter(|h| h.interest.wants(event.kind())) {
-                                    if !run_callback(&weak, handler, event.clone(), &counters, &cancelled, &shutdown).await {
-                                        return;
-                                    }
+                                if !run_queued_event(&weak, &handlers, queued, &counters, &cancelled, &shutdown).await {
+                                    return;
                                 }
                             }
                         })));
@@ -345,8 +342,10 @@ impl EventHandler for CallbackEventHandler {
                     let cancelled = self.stop.subscribe();
                     let shutdown = self.shutdown.clone();
                     client.runtime.spawn_detached(Box::pin(async move {
-                        run_callback(&weak, &handler, event, &counters, &cancelled, &shutdown)
-                            .await;
+                        run_callback(
+                            &weak, &handler, event, &counters, &cancelled, &shutdown, None,
+                        )
+                        .await;
                     }));
                 }
             }
@@ -383,6 +382,35 @@ impl EventHandler for CallbackEventHandler {
     }
 }
 
+async fn run_queued_event(
+    weak: &Weak<Client>,
+    handlers: &[RegisteredHandler],
+    mut queued: QueuedEvent,
+    counters: &Arc<Counters>,
+    cancelled: &ShutdownSignal,
+    shutdown: &ShutdownSignal,
+) -> bool {
+    let Some(event) = queued.event.as_ref().cloned() else {
+        return true;
+    };
+    for handler in handlers.iter().filter(|h| h.interest.wants(event.kind())) {
+        if !run_callback(
+            weak,
+            handler,
+            event.clone(),
+            counters,
+            cancelled,
+            shutdown,
+            Some(&mut queued),
+        )
+        .await
+        {
+            return false;
+        }
+    }
+    true
+}
+
 async fn run_callback(
     weak: &Weak<Client>,
     handler: &RegisteredHandler,
@@ -390,6 +418,7 @@ async fn run_callback(
     counters: &Arc<Counters>,
     cancelled: &ShutdownSignal,
     shutdown: &ShutdownSignal,
+    queued: Option<&mut QueuedEvent>,
 ) -> bool {
     if cancelled.is_fired() || shutdown.is_fired() {
         return false;
@@ -397,25 +426,37 @@ async fn run_callback(
     let Some(client) = weak.upgrade() else {
         return false;
     };
-    let mut guard = CallbackGuard::new(counters.clone());
-    // Future creation is user code too; catch both creation and polling panics.
-    let callback = std::panic::AssertUnwindSafe(async { (handler.callback)(event, client).await })
-        .catch_unwind()
-        .fuse();
+    let callback = async {
+        if cancelled.is_fired() || shutdown.is_fired() {
+            return false;
+        }
+        // Dequeue is not callback start: retain the discard guard until this
+        // branch is polled, including cancellation before the first callback.
+        if let Some(queued) = queued {
+            queued.event.take();
+        }
+        let mut guard = CallbackGuard::new(counters.clone());
+        // Future creation is user code too; catch both creation and polling panics.
+        let result =
+            std::panic::AssertUnwindSafe(async { (handler.callback)(event, client).await })
+                .catch_unwind()
+                .await;
+        guard.finished = true;
+        if result.is_ok() {
+            counters.completed.fetch_add(1, Ordering::Relaxed);
+        } else {
+            counters.panicked.fetch_add(1, Ordering::Relaxed);
+            log::warn!("event delivery callback panicked; continuing");
+        }
+        true
+    }
+    .fuse();
     let cancel = wait_for_shutdown(cancelled).fuse();
     let terminal = wait_for_shutdown(shutdown).fuse();
     futures::pin_mut!(callback, cancel, terminal);
     futures::select_biased! {
         _ = cancel => false,
         _ = terminal => false,
-        result = callback => {
-            guard.finished = true;
-            if result.is_ok() { counters.completed.fetch_add(1, Ordering::Relaxed); }
-            else {
-                counters.panicked.fetch_add(1, Ordering::Relaxed);
-                log::warn!("event delivery callback panicked; continuing");
-            }
-            true
-        }
+        result = callback => result,
     }
 }

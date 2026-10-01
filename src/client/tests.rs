@@ -3721,7 +3721,7 @@ async fn runtime_cache_config_honors_disabled_recent_cache() {
 /// the runtime-retained `RuntimeCacheConfig` (456 B down to 136 B on the
 /// structs). A struct-level delta alone does not prove the per-client saving,
 /// since neighbor-field padding could absorb part of it. The current fixed
-/// client layout is 4320 B before feature-sized fields and the 56 B pending
+/// client layout is 4288 B before feature-sized fields and the 56 B pending
 /// call-offer tracker. The tracker is needed even without the VoIP subsystem:
 /// a terminate must cancel an offer paused on identity learning. It retains
 /// only in-flight offers, and `memory_report()` exposes their count. The

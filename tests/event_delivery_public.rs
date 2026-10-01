@@ -70,6 +70,13 @@ async fn dispatch(client: &Arc<Client>, state: &'static str, media: Option<&str>
             .await
     );
 }
+async fn receive<T>(receiver: &async_channel::Receiver<T>) -> T {
+    tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+        .await
+        .expect("observer receive deadline")
+        .expect("observer channel open")
+}
+
 async fn eventually(mut predicate: impl FnMut() -> bool) {
     tokio::time::timeout(Duration::from_secs(5), async {
         while !predicate() {
@@ -97,7 +104,7 @@ async fn async_observer_is_filtered_and_subscription_is_raii() {
     );
     let subscription = client.subscribe_handler(handler.clone());
     dispatch(&client, "composing", Some("audio")).await;
-    let observed = rx.recv().await.unwrap();
+    let observed = receive(&rx).await;
     assert!(
         matches!(&*observed, Event::ChatPresence(update) if update.source.chat.to_string() == "120363000001@g.us" && update.source.sender.to_string() == "15550001111@s.whatsapp.net")
     );
@@ -126,7 +133,7 @@ async fn chatstate_compatibility_view_uses_the_same_bus_fact() {
         ("paused", None, ReceivedChatState::Idle),
     ] {
         dispatch(&client, state, media).await;
-        let observed = rx.recv().await.unwrap();
+        let observed = receive(&rx).await;
         assert_eq!(observed.chat.to_string(), "120363000001@g.us");
         assert_eq!(
             observed.participant.unwrap().to_string(),
@@ -164,7 +171,7 @@ async fn bounded_pool_drops_newest_without_stalling_protocol_handler() {
     let _subscription = client.subscribe_handler(handler.clone());
     for _ in 0..2 {
         dispatch(&client, "composing", None).await;
-        rx.recv().await.unwrap();
+        receive(&rx).await;
     }
     for _ in 0..12 {
         dispatch(&client, "composing", None).await;

@@ -268,6 +268,91 @@ async fn interest_filter_skips_payload_and_callback_future_creation() {
 }
 
 #[tokio::test]
+async fn cancellation_after_dequeue_before_callback_start_counts_discard() {
+    let client = create_test_client().await;
+    for terminal in [false, true] {
+        let counters = Arc::new(Counters::default());
+        counters.accepted.store(1, Ordering::Relaxed);
+        let queued = QueuedEvent {
+            event: Some(event("dequeued")),
+            counters: counters.clone(),
+        };
+        let handler = RegisteredHandler {
+            callback: Arc::new(|_, _| panic!("cancelled callback was constructed")),
+            interest: EventInterest::ALL,
+        };
+        let stop = ShutdownNotifier::new();
+        let shutdown = ShutdownNotifier::new();
+        // Trigger the race boundary after the queue hands over its payload,
+        // before the first callback is polled. The same helper owns the
+        // dequeue/start distinction on the production worker path.
+        if terminal {
+            shutdown.notify();
+        } else {
+            stop.notify();
+        }
+        assert!(
+            !run_queued_event(
+                &Arc::downgrade(&client),
+                &[handler],
+                queued,
+                &counters,
+                &stop.subscribe(),
+                &shutdown.subscribe()
+            )
+            .await
+        );
+        assert_eq!(counters.accepted.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.discarded.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.started.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.active.load(Ordering::Relaxed), 0);
+        assert_eq!(counters.cancelled.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[tokio::test]
+async fn cancellation_between_callbacks_is_not_an_unstarted_event_discard() {
+    let client = create_test_client().await;
+    let counters = Arc::new(Counters::default());
+    let stop = Arc::new(ShutdownNotifier::new());
+    let first_stop = stop.clone();
+    let handlers = [
+        RegisteredHandler {
+            callback: Arc::new(move |_, _| {
+                let stop = first_stop.clone();
+                Box::pin(async move {
+                    stop.notify();
+                })
+            }),
+            interest: EventInterest::ALL,
+        },
+        RegisteredHandler {
+            callback: Arc::new(|_, _| panic!("second callback must not start")),
+            interest: EventInterest::ALL,
+        },
+    ];
+    let queued = QueuedEvent {
+        event: Some(event("sequence")),
+        counters: counters.clone(),
+    };
+    assert!(
+        !run_queued_event(
+            &Arc::downgrade(&client),
+            &handlers,
+            queued,
+            &counters,
+            &stop.subscribe(),
+            &ShutdownSignal::never()
+        )
+        .await
+    );
+    assert_eq!(counters.started.load(Ordering::Relaxed), 1);
+    assert_eq!(counters.completed.load(Ordering::Relaxed), 1);
+    assert_eq!(counters.discarded.load(Ordering::Relaxed), 0);
+    assert_eq!(counters.cancelled.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
 async fn concurrent_panics_are_isolated_and_counted() {
     let client = create_test_client().await;
     let adapter = CallbackEventHandler::from_callback(
