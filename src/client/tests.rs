@@ -3736,12 +3736,11 @@ async fn runtime_cache_config_honors_disabled_recent_cache() {
 fn client_size_pins_runtime_cache_config_saving() {
     use std::mem::size_of;
 
-    // Measured fixed part of `size_of::<Client>()` at the head of the #1482
-    // follow-ups, default features, no subsystem attached. Every
-    // size-varying attachment is measured in this same build and stacked on
-    // top, so no feature combination false-fails: only an unaccounted layout
-    // move trips the assert.
-    let mut expected = 4320
+    // Fixed part after removing the duplicate chatstate RwLock<Arc<[handler]>>
+    // table (32 inline bytes on this target); its count remains one pointer.
+    // Every size-varying attachment is measured in this same build and stacked
+    // on top, so only an unaccounted layout move trips the assert.
+    let mut expected = 4288
         + size_of::<subsystem::Subsystems>()
         + size_of::<crate::handlers::call::pending_offers::PendingOffers>()
         + size_of::<Arc<std::sync::Mutex<crate::retry::HistoryPayloadRegistry>>>();
@@ -6307,6 +6306,129 @@ async fn chatstate_dispatch_reaches_every_registered_handler() {
         1,
         "the event is built once and cloned per handler"
     );
+}
+
+#[tokio::test]
+async fn chatstate_bus_adapter_preserves_parsed_states_and_subscription_lifetime() {
+    use crate::handlers::chatstate::ChatstateHandler;
+    use crate::handlers::traits::StanzaHandler;
+    use wacore::iq::chatstate::ReceivedChatState;
+    use wacore::types::events::{ChannelEventHandler, EventInterest, EventKind};
+    let client = crate::test_utils::create_test_client().await;
+    let (tx, rx) = async_channel::unbounded();
+    let subscription = client.subscribe_chatstate_handler(Arc::new(move |event| {
+        tx.try_send(event).unwrap();
+    }));
+    let (bus, events) = ChannelEventHandler::with_capacity(8);
+    let _bus_subscription = client.subscribe(EventInterest::of(&[EventKind::ChatPresence]), bus);
+    for group in [false, true] {
+        for (tag, media, expected) in [
+            ("composing", None, ReceivedChatState::Typing),
+            (
+                "composing",
+                Some("audio"),
+                ReceivedChatState::RecordingAudio,
+            ),
+            ("paused", None, ReceivedChatState::Idle),
+        ] {
+            let chat = if group {
+                "120363000001@g.us"
+            } else {
+                "15550002222@s.whatsapp.net"
+            };
+            let mut state = NodeBuilder::new(tag);
+            if let Some(media) = media {
+                state = state.attr("media", media);
+            }
+            let mut stanza = NodeBuilder::new("chatstate")
+                .attr("from", chat)
+                .children([state.build()]);
+            if group {
+                stanza = stanza.attr("participant", "15550003333@s.whatsapp.net");
+            }
+            assert!(
+                ChatstateHandler
+                    .handle(
+                        client.clone(),
+                        crate::test_utils::node_to_owned_ref(&stanza.build()),
+                        &mut false
+                    )
+                    .await
+            );
+            let legacy_view = rx.recv().await.unwrap();
+            assert_eq!(legacy_view.chat.to_string(), chat);
+            assert_eq!(legacy_view.state, expected);
+            assert_eq!(
+                legacy_view.participant.as_ref().map(ToString::to_string),
+                group.then(|| "15550003333@s.whatsapp.net".to_string())
+            );
+            let Event::ChatPresence(update) = &*events.recv().await.unwrap() else {
+                panic!("chat presence")
+            };
+            let equivalent = ChatStateEvent::from_presence(update);
+            assert_eq!(equivalent.chat, legacy_view.chat);
+            assert_eq!(equivalent.participant, legacy_view.participant);
+            assert_eq!(equivalent.state, legacy_view.state);
+            assert!(
+                rx.try_recv().is_err(),
+                "one fact per registration, no second dispatcher"
+            );
+        }
+    }
+    drop(subscription);
+    client
+        .dispatch_chatstate_event(test_chatstate_stanza())
+        .await;
+    assert!(rx.try_recv().is_err());
+    assert_eq!(client.chatstate_handler_count.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn slow_callback_does_not_hold_chatstate_protocol_dispatch() {
+    use crate::bot::{CallbackEventHandler, EventDelivery};
+    use crate::handlers::{chatstate::ChatstateHandler, traits::StanzaHandler};
+    use wacore::types::events::{ChannelEventHandler, EventInterest, EventKind};
+    let client = crate::test_utils::create_test_client().await;
+    let (started_tx, started_rx) = async_channel::bounded(1);
+    let callback = CallbackEventHandler::from_callback(
+        &client,
+        EventInterest::of(&[EventKind::ChatPresence]),
+        EventDelivery::Ordered { capacity: 1 },
+        move |_, _| {
+            let tx = started_tx.clone();
+            async move {
+                tx.send(()).await.unwrap();
+                std::future::pending::<()>().await;
+            }
+        },
+    );
+    let _callback_subscription = client.subscribe_handler(callback.clone());
+    let (bus, events) = ChannelEventHandler::with_capacity(8);
+    let _bus_subscription = client.subscribe_handler(bus);
+    let node = crate::test_utils::node_to_owned_ref(
+        &NodeBuilder::new("chatstate")
+            .attr("from", "15550002222@s.whatsapp.net")
+            .children([NodeBuilder::new("composing").build()])
+            .build(),
+    );
+    ChatstateHandler
+        .handle(client.clone(), node.clone(), &mut false)
+        .await;
+    started_rx.recv().await.unwrap();
+    // The actual stanza handler keeps dispatching while the consumer is parked.
+    for _ in 0..3 {
+        ChatstateHandler
+            .handle(client.clone(), node.clone(), &mut false)
+            .await;
+    }
+    assert_eq!(events.len(), 4);
+    assert_eq!(callback.stats().dropped_full, 2);
+    assert_eq!(callback.stats().callbacks_active, 1);
+    client.shutdown().await;
+    crate::test_utils::poll_until("slow callback cancelled", || {
+        callback.stats().callbacks_active == 0
+    })
+    .await;
 }
 
 // --- stanza interceptors ---------------------------------------------------
