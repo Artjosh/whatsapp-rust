@@ -28,7 +28,7 @@ mod sessions;
 pub(crate) mod subsystem;
 pub(crate) mod voip;
 use builder::{ClientAssembly, ClientExtensions};
-pub use builder::{ClientBuild, ClientBuilder, ClientBuilderError};
+pub use builder::{ClientBuild, ClientBuilder, ClientBuilderError, ClientOptions};
 pub(crate) use device_memo_stats::{
     DeviceMemoCounters, GroupDevicesMemoOutcome, SkdmTargetsMemoOutcome,
 };
