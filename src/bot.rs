@@ -10,15 +10,15 @@ use crate::store::persistence_manager::PersistenceManager;
 use crate::store::traits::Backend;
 use crate::types::durability_hook::InboundDurabilityHook;
 use crate::types::enc_handler::EncHandler;
-use crate::types::events::{Event, EventHandler, EventInterest, EventKind};
+use crate::types::events::{Event, EventHandler, EventInterest, EventKind, Subscription};
 use crate::types::history_sync_admission::HistorySyncAdmission;
 use crate::types::message::MessageInfo;
 use log::{info, warn};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use wacore::handshake::NoiseCertPolicy;
 use wacore::proto_helpers::MessageBuilderExt;
@@ -279,14 +279,63 @@ pub struct BotShutdownReport {
     pub run: BotRunOutcome,
 }
 
+// Builder callbacks belong to the driver, not the Client's event bus lifetime.
+// Either guard can close this shared registration, including an unpolled driver.
+// Take it out of the mutex before bus removal or worker aborts (both can reenter).
+struct CallbackRegistration {
+    subscription: Subscription,
+    handler: Arc<CallbackEventHandler>,
+}
+
+#[derive(Clone, Default)]
+struct BotCallbackGuard {
+    registration: Option<Arc<Mutex<Option<CallbackRegistration>>>>,
+}
+
+impl BotCallbackGuard {
+    fn new(subscription: Subscription, handler: Arc<CallbackEventHandler>) -> Self {
+        Self {
+            registration: Some(Arc::new(Mutex::new(Some(CallbackRegistration {
+                subscription,
+                handler,
+            })))),
+        }
+    }
+
+    fn cancel(&self) {
+        let registration = self.registration.as_ref().and_then(|registration| {
+            registration
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+        });
+        if let Some(CallbackRegistration {
+            subscription,
+            handler,
+        }) = registration
+        {
+            drop(subscription);
+            handler.cancel();
+        }
+    }
+}
+
+impl Drop for BotCallbackGuard {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
 /// Handle to a bot started in the background via [`Bot::spawn`]. Awaiting it
 /// preserves the run outcome, or reports an abort request / unobserved exit.
 ///
-/// Dropping the handle aborts the bot task. Keep it alive for as long as the
+/// Dropping the handle aborts the bot task and its builder callback delivery,
+/// without joining or draining callbacks. Keep it alive for as long as the
 /// bot should run, and prefer [`BotHandle::shutdown`] to stop it.
 #[must_use = "dropping the handle aborts the bot; bind it and await it, or call .shutdown()"]
 pub struct BotHandle {
     client: Arc<Client>,
+    callbacks: BotCallbackGuard,
     done_rx: futures::channel::oneshot::Receiver<crate::RunCompletionReason>,
     abort_handle: wacore::runtime::AbortHandle,
     abort_requested: AtomicBool,
@@ -309,10 +358,12 @@ impl BotHandle {
 
     /// Abort the bot task immediately. Skips the flush work
     /// [`BotHandle::shutdown`] performs, so recently captured state may be
-    /// lost; escape hatch only.
+    /// lost; escape hatch only. Also cancels builder callbacks without draining
+    /// or waiting for the runtime to acknowledge driver cancellation.
     pub fn abort(&self) {
         self.abort_requested.store(true, Ordering::Release);
         self.abort_waker.wake();
+        self.callbacks.cancel();
         self.abort_handle.abort();
     }
 }
@@ -391,7 +442,10 @@ async fn run_metered<F: std::future::Future>(
 /// Handlers registered through the builder (`on_message`, `on_event`, …)
 /// receive typed [`Event`] payloads. Anything the
 /// builder does not expose is reachable on the underlying client via
-/// [`Bot::client`], which stays valid after the bot is started.
+/// [`Bot::client`], which stays valid after the bot is started. Builder callback
+/// delivery ends with the driver, including foreground future cancellation;
+/// accepted callbacks are aborted, not drained or joined. Independent Client
+/// subscriptions and raw handlers keep their existing ownership policies.
 pub struct Bot {
     client: Arc<Client>,
     sync_task_receiver: Option<async_channel::Receiver<crate::sync_task::MajorSyncTask>>,
@@ -460,24 +514,28 @@ impl Bot {
     )]
     async fn run_graph(self) -> crate::RunCompletionReason {
         let instrument = self.task_instrument.clone();
-        let client = self.start_background();
+        let (client, _callbacks) = self.start_background();
         run_metered(client.run(), instrument).await
     }
 
     /// Start the bot on its runtime and return a [`BotHandle`] to await,
     /// gracefully shut down, or abort it.
     pub fn spawn(self) -> BotHandle {
-        let client = self.start_background();
+        let (client, callbacks) = self.start_background();
 
         let run_client = client.clone();
+        let driver_callbacks = callbacks.clone();
         let (done_tx, done_rx) = futures::channel::oneshot::channel();
         let abort_handle = client.runtime.spawn(Box::pin(async move {
+            let callbacks = driver_callbacks;
             let reason = run_client.run().await;
+            drop(callbacks);
             let _ = done_tx.send(reason);
         }));
 
         BotHandle {
             client,
+            callbacks,
             done_rx,
             abort_handle,
             abort_requested: AtomicBool::new(false),
@@ -487,7 +545,7 @@ impl Bot {
 
     /// Wires the background workers and event handlers, returning the client
     /// that drives the connection. Shared by [`Bot::run`] and [`Bot::spawn`].
-    fn start_background(self) -> Arc<Client> {
+    fn start_background(self) -> (Arc<Client>, BotCallbackGuard) {
         let Bot {
             client,
             sync_task_receiver,
@@ -502,17 +560,17 @@ impl Bot {
             client.start_sync_task_worker(receiver);
         }
 
-        if !event_handlers.is_empty() {
-            client
-                .core
-                .event_bus
-                .subscribe_handler(Arc::new(CallbackBusAdapter::new(
-                    client.clone(),
-                    event_handlers,
-                    event_delivery,
-                )))
-                .detach();
-        }
+        let callbacks = if event_handlers.is_empty() {
+            BotCallbackGuard::default()
+        } else {
+            let handler = Arc::new(CallbackBusAdapter::new(
+                client.clone(),
+                event_handlers,
+                event_delivery,
+            ));
+            let subscription = client.subscribe_handler(handler.clone());
+            BotCallbackGuard::new(subscription, handler)
+        };
         for handler in raw_handlers {
             client.core.event_bus.subscribe_handler(handler).detach();
         }
@@ -562,7 +620,7 @@ impl Bot {
             })).detach();
         }
 
-        client
+        (client, callbacks)
     }
 }
 
@@ -2524,6 +2582,7 @@ mod tests {
     ) -> BotHandle {
         BotHandle {
             client,
+            callbacks: BotCallbackGuard::default(),
             done_rx,
             abort_handle,
             abort_requested: AtomicBool::new(false),
@@ -2640,6 +2699,127 @@ mod tests {
         drop(handle);
         assert_eq!(aborted.load(Ordering::Relaxed), 1);
         client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn bot_driver_guard_preserves_queue_and_active_cancellation_accounting() {
+        let (entered_tx, entered_rx) = async_channel::bounded(1);
+        let bot = Bot::builder()
+            .with_backend_arc(create_test_sqlite_backend().await)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_runtime(TokioRuntime)
+            .with_event_delivery(EventDelivery::Ordered { capacity: 2 })
+            .on_event_for(&[EventKind::Connected], move |_, client| {
+                let entered = entered_tx.clone();
+                async move {
+                    entered.try_send(()).unwrap();
+                    std::future::pending::<()>().await;
+                    drop(client);
+                }
+            })
+            .build()
+            .await
+            .unwrap();
+        let client = bot.client();
+        client.pause().await;
+        let handle = bot.spawn();
+        let adapter = handle
+            .callbacks
+            .registration
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .handler
+            .clone();
+        let connected = || Event::Connected(crate::types::events::Connected::builder().build());
+        client.core.event_bus.dispatch(connected());
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        for _ in 0..3 {
+            client.core.event_bus.dispatch(connected());
+        }
+        assert_eq!(adapter.stats().accepted, 3);
+        assert_eq!(adapter.stats().dropped_full, 1);
+        assert_eq!(adapter.stats().callbacks_active, 1);
+        handle.abort();
+        assert!(!client.shutdown_signal().is_fired());
+        client
+            .core
+            .event_bus
+            .dispatch_with(EventKind::Connected, || {
+                panic!("closed builder registration still constructs payloads")
+            });
+        crate::test_utils::poll_until("scoped callback cancellation", || {
+            adapter.stats().callbacks_active == 0 && adapter.stats().discarded == 2
+        })
+        .await;
+        assert_eq!(adapter.stats().accepted, 3);
+        assert_eq!(adapter.stats().callbacks_started, 1);
+        assert_eq!(adapter.stats().callbacks_cancelled, 1);
+        assert_eq!(adapter.stats().callbacks_completed, 0);
+        assert_eq!(client.stats().events_dropped, 1);
+        drop(handle);
+        let weak = Arc::downgrade(&client);
+        drop(client);
+        crate::test_utils::poll_until("scoped Client released", || weak.upgrade().is_none()).await;
+    }
+
+    #[tokio::test]
+    async fn unpolled_bot_driver_guard_discards_queue_without_starting_callbacks() {
+        let bot = Bot::builder()
+            .with_backend_arc(create_test_sqlite_backend().await)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_runtime(TokioRuntime)
+            .with_event_delivery(EventDelivery::Ordered { capacity: 1 })
+            .on_event_for(&[EventKind::Connected], |_, _| async {
+                panic!("callback started after unpolled driver cancellation")
+            })
+            .build()
+            .await
+            .unwrap();
+        let client = bot.client();
+        let handle = bot.spawn();
+        let adapter = handle
+            .callbacks
+            .registration
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .handler
+            .clone();
+        let event = Arc::new(Event::Connected(
+            crate::types::events::Connected::builder().build(),
+        ));
+        let weak_event = Arc::downgrade(&event);
+        adapter.handle_event(event);
+        assert_eq!(adapter.stats().callbacks_started, 0);
+        drop(handle);
+        assert!(!client.core.event_bus.has_handler_for(EventKind::Connected));
+        assert!(!client.shutdown_signal().is_fired());
+        crate::test_utils::poll_until("unpolled driver queue released", || {
+            weak_event.upgrade().is_none() && adapter.stats().discarded == 1
+        })
+        .await;
+        assert_eq!(adapter.stats().accepted, 1);
+        assert_eq!(adapter.stats().callbacks_started, 0);
+        assert_eq!(adapter.stats().callbacks_active, 0);
+        assert_eq!(adapter.stats().callbacks_cancelled, 0);
+        let weak = Arc::downgrade(&client);
+        drop(client);
+        crate::test_utils::poll_until("unpolled driver Client released", || {
+            weak.upgrade().is_none()
+        })
+        .await;
     }
 
     #[tokio::test]
