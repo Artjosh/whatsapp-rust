@@ -2554,6 +2554,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn background_outcome_preserves_typed_protocol_conflict() {
+        let client = crate::test_utils::create_test_client().await;
+        for kind in [
+            crate::ConflictKind::Replaced,
+            crate::ConflictKind::DeviceRemoved,
+            crate::ConflictKind::Unknown,
+        ] {
+            let (sender, receiver) = futures::channel::oneshot::channel();
+            sender
+                .send(crate::RunCompletionReason::AutoReconnectDisabled {
+                    connection: None,
+                    connect_error: None,
+                    protocol_error: Some(crate::ProtocolTerminalReason::Conflict(kind)),
+                })
+                .unwrap();
+            let handle = background_handle_for_test(
+                client.clone(),
+                receiver,
+                wacore::runtime::AbortHandle::noop(),
+            );
+            match handle.await {
+                BotRunOutcome::Completed(crate::RunCompletionReason::AutoReconnectDisabled {
+                    protocol_error: Some(crate::ProtocolTerminalReason::Conflict(observed)),
+                    ..
+                }) => assert_eq!(observed, kind),
+                other => panic!("lost typed protocol cause: {other:?}"),
+            }
+        }
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn explicit_abort_does_not_wait_for_a_retained_sender() {
         let client = crate::test_utils::create_test_client().await;
         let (_retained_sender, receiver) = futures::channel::oneshot::channel();

@@ -231,7 +231,7 @@ pub use client::{
 #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
 pub use client::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
 pub use client::{
-    ConnectError, ConnectStage, DrainOutcome, ProtocolTerminalReason, Reachability,
+    ConflictKind, ConnectError, ConnectStage, DrainOutcome, ProtocolTerminalReason, Reachability,
     RunCompletionReason, SecretFlushReport, ShutdownReport, SignalMaintenanceError,
 };
 pub use types::durability_hook::InboundDurabilityHook;
@@ -355,6 +355,9 @@ pub use features::{
     UsernameLookupUser, UsyncSubprotocolError, VariantProperty, VerifiedName, group_type,
     message_key, message_range,
 };
+pub use features::{MexDoc, MexOperation};
+
+pub use features::{ProfilePictureRequest, ProfilePictureTarget, ProfilePictureType};
 
 pub mod bot;
 pub use bot::{
@@ -384,8 +387,8 @@ pub mod prelude {
     #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
     pub use crate::client::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
     pub use crate::client::{
-        ConnectError, ConnectStage, DrainOutcome, ProtocolTerminalReason, RunCompletionReason,
-        SecretFlushReport, ShutdownReport,
+        ConflictKind, ConnectError, ConnectStage, DrainOutcome, ProtocolTerminalReason,
+        RunCompletionReason, SecretFlushReport, ShutdownReport,
     };
     #[cfg(feature = "plugins")]
     #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
