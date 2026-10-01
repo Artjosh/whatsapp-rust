@@ -357,6 +357,8 @@ pub use features::{
 };
 pub use features::{MexDoc, MexOperation};
 
+pub use features::{ProfilePictureRequest, ProfilePictureTarget, ProfilePictureType};
+
 pub mod bot;
 pub mod lid_pn_cache;
 #[cfg(feature = "signal")]
