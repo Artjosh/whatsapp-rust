@@ -1014,17 +1014,17 @@ mod tests {
     #[tokio::test]
     async fn failed_secret_writes_remain_observable_after_buffer_empties() {
         use crate::store::error::StoreError;
-        use whatsapp_rust_sqlite_storage::{SqliteStore, SqliteStoreConfig};
+        use whatsapp_rust_sqlite_storage::{SqliteDatabase, SqliteDatabaseConfig};
         let fail = Arc::new(AtomicBool::new(false));
         let barrier_fail = fail.clone();
         // Same named shared-memory URI supported by create_test_backend.
-        let database = format!(
+        let database_url = format!(
             "file:secret-write-failure-{}?mode=memory&cache=shared",
             std::process::id()
         );
-        let store = SqliteStore::with_config(
-            &database,
-            SqliteStoreConfig::default().with_commit_barrier(Arc::new(move || {
+        let database = SqliteDatabase::open(
+            &database_url,
+            SqliteDatabaseConfig::default().with_commit_barrier(Arc::new(move || {
                 let fail = barrier_fail.clone();
                 Box::pin(async move {
                     if fail.load(Ordering::Acquire) {
@@ -1039,8 +1039,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let buffer =
-            MsgSecretWriteBuffer::new(Arc::new(store), Arc::new(crate::runtime_impl::TokioRuntime));
+        let buffer = MsgSecretWriteBuffer::new(
+            Arc::new(database.store(1)),
+            Arc::new(crate::runtime_impl::TokioRuntime),
+        );
         buffer
             .queue_one(entry("100@g.us", "15550000001@s.whatsapp.net", "FAIL", 7))
             .await;
