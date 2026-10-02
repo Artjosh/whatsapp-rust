@@ -10016,6 +10016,124 @@ where
     None
 }
 
+#[tokio::test]
+async fn plaintext_ownership_boundary_preserves_carrier_and_resend_dispatch() {
+    use wacore::messages::MessageUtils;
+
+    let client = crate::test_utils::create_test_client().await;
+    let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+    let _subscription = client.subscribe_handler(collector.clone());
+    let info = Arc::new(MessageInfo {
+        id: "DELAYED_PLAINTEXT".into(),
+        source: wacore::types::message::MessageSource {
+            chat: "15550000101@s.whatsapp.net".parse().unwrap(),
+            sender: "15550000101@s.whatsapp.net".parse().unwrap(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let mut message = wa::Message::default();
+    message
+        .sender_key_distribution_message
+        .get_or_insert_default();
+    let carrier = client
+        .handle_decrypted_plaintext(
+            "msg",
+            MessageUtils::encode_and_pad(&message),
+            2,
+            0,
+            Default::default(),
+            &info,
+        )
+        .await
+        .unwrap();
+    assert!(carrier.skdm_only);
+    assert!(!carrier.dispatched);
+    assert!(
+        collector
+            .events()
+            .iter()
+            .all(|event| !matches!(event.as_ref(), Event::Messages(_)))
+    );
+    assert!(!client.message_already_dispatched(&info).await);
+
+    // The same carrier with visible content must publish once, and its resend
+    // must still take the duplicate path rather than the SKDM-only exit.
+    message.conversation = Some("visible carrier".into());
+    for _ in 0..2 {
+        let outcome = client
+            .handle_decrypted_plaintext(
+                "msg",
+                MessageUtils::encode_and_pad(&message),
+                2,
+                0,
+                Default::default(),
+                &info,
+            )
+            .await
+            .unwrap();
+        assert!(outcome.dispatched);
+        assert!(!outcome.skdm_only);
+    }
+    let events = collector.events();
+    let messages: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event.as_ref() {
+            Event::Messages(batch) => Some(batch.messages.iter()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        messages[0].message.conversation.as_deref(),
+        Some("visible carrier")
+    );
+    assert!(messages[0].message.sender_key_distribution_message.is_set());
+    assert!(Arc::ptr_eq(&info, &messages[0].info));
+    assert_eq!(client.stats().messages_suppressed_duplicate, 1);
+}
+
+#[tokio::test]
+async fn shared_plaintext_dispatch_keeps_the_event_message_allocation() {
+    let client = crate::test_utils::create_test_client().await;
+    let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+    let _subscription = client.subscribe_handler(collector.clone());
+    let info = Arc::new(MessageInfo {
+        id: "SHARED_PLAINTEXT".into(),
+        source: wacore::types::message::MessageSource {
+            chat: "15550000101@s.whatsapp.net".parse().unwrap(),
+            sender: "15550000101@s.whatsapp.net".parse().unwrap(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let message = Arc::new(wa::Message {
+        conversation: Some("shared plaintext".into()),
+        ..Default::default()
+    });
+    assert!(matches!(
+        client
+            .dispatch_shared_message_with_decrypted(Arc::clone(&message), &info, false, None)
+            .await,
+        InboundCommitState::Durable
+    ));
+    let event = collect_event(
+        &client,
+        collector,
+        |event| matches!(event, Event::Messages(_)),
+        1000,
+    )
+    .await
+    .expect("plaintext event");
+    let Event::Messages(batch) = event.as_ref() else {
+        panic!("expected Messages");
+    };
+    assert_eq!(batch.messages.len(), 1);
+    assert!(Arc::ptr_eq(&message, &batch.messages[0].message));
+    assert!(Arc::ptr_eq(&info, &batch.messages[0].info));
+}
+
 fn legacy_edit_text(msg: &wa::Message) -> Option<&str> {
     msg.protocol_message
         .as_option()
@@ -15988,10 +16106,14 @@ mod pdo_alias_tests {
                                 },
                                 ID.into(),
                             ),
-                            crate::pdo::PendingPdoRequest {
-                                message_info: info.clone(),
-                                requested_at: wacore::time::Instant::now(),
-                            },
+                            crate::pdo::test_pending(
+                                crate::pdo::PendingPdoRequest {
+                                    message_info: info.clone(),
+                                    requested_at: wacore::time::Instant::now(),
+                                },
+                                "SYNTHETIC_PDO_REQUEST",
+                                false,
+                            ),
                         )
                         .await;
                 }
@@ -16227,10 +16349,14 @@ mod pdo_alias_tests {
             .pdo_pending_requests
             .insert(
                 wacore::types::message::ChatMessageId::new(info.source.chat.clone(), ID.into()),
-                crate::pdo::PendingPdoRequest {
-                    message_info: info.clone(),
-                    requested_at: wacore::time::Instant::now(),
-                },
+                crate::pdo::test_pending(
+                    crate::pdo::PendingPdoRequest {
+                        message_info: info.clone(),
+                        requested_at: wacore::time::Instant::now(),
+                    },
+                    "SYNTHETIC_PDO_REQUEST",
+                    false,
+                ),
             )
             .await;
         retry(&client, &info).await;
@@ -16290,6 +16416,8 @@ struct PdoRetryFixture {
     phone_response: Arc<OwnedNodeRef>,
     response: wa::message::PeerDataOperationRequestResponseMessage,
     phone_info: MessageInfo,
+    phone: AlicePeer,
+    receiver: Jid,
 }
 
 impl PdoRetryFixture {
@@ -16371,10 +16499,14 @@ impl PdoRetryFixture {
             .pdo_pending_requests
             .insert(
                 wacore::types::message::ChatMessageId::new(group.clone(), Self::ID.into()),
-                crate::pdo::PendingPdoRequest {
-                    message_info: info,
-                    requested_at: wacore::time::Instant::now(),
-                },
+                crate::pdo::test_pending(
+                    crate::pdo::PendingPdoRequest {
+                        message_info: info,
+                        requested_at: wacore::time::Instant::now(),
+                    },
+                    "SYNTHETIC_PDO_REQUEST",
+                    false,
+                ),
             )
             .await;
         let recovered = wa::WebMessageInfo {
@@ -16417,29 +16549,7 @@ impl PdoRetryFixture {
             .session_state_mut()
             .unwrap()
             .clear_unacknowledged_pre_key_message();
-        let ciphertext = phone.encrypt(&receiver.to_protocol_address(), &MessageUtils::encode_and_pad(&wa::Message {
-            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
-                r#type: Some(wa::message::protocol_message::Type::PEER_DATA_OPERATION_REQUEST_RESPONSE_MESSAGE),
-                peer_data_operation_request_response_message: buffa::MessageField::some(response.clone()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        })).await;
-        let payload = enc_payload_from_ciphertext(&ciphertext);
-        let phone_response = node_to_arc(
-            NodeBuilder::new("message")
-                .attr("from", phone.jid)
-                .attr("id", "SYNTHETIC_PDO_RESPONSE")
-                .attr("type", "text")
-                .attr("category", "peer")
-                .attr("t", wacore::time::now_secs().to_string())
-                .children([NodeBuilder::new("enc")
-                    .attr("type", payload.enc_type.as_wire_str())
-                    .attr("v", "2")
-                    .bytes(payload.ciphertext.to_vec())
-                    .build()])
-                .build(),
-        );
+        let phone_response = Self::encode_phone_response(&mut phone, &receiver, &response).await;
         let phone_info = client
             .parse_message_info(phone_response.get())
             .await
@@ -16456,7 +16566,39 @@ impl PdoRetryFixture {
             phone_response,
             response,
             phone_info,
+            phone,
+            receiver,
         }
+    }
+
+    async fn encode_phone_response(
+        phone: &mut AlicePeer,
+        receiver: &Jid,
+        response: &wa::message::PeerDataOperationRequestResponseMessage,
+    ) -> Arc<OwnedNodeRef> {
+        let ciphertext = phone.encrypt(&receiver.to_protocol_address(), &MessageUtils::encode_and_pad(&wa::Message {
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::PEER_DATA_OPERATION_REQUEST_RESPONSE_MESSAGE),
+                peer_data_operation_request_response_message: buffa::MessageField::some(response.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })).await;
+        let payload = enc_payload_from_ciphertext(&ciphertext);
+        node_to_arc(
+            NodeBuilder::new("message")
+                .attr("from", phone.jid.clone())
+                .attr("id", "SYNTHETIC_PDO_RESPONSE")
+                .attr("type", "text")
+                .attr("category", "peer")
+                .attr("t", wacore::time::now_secs().to_string())
+                .children([NodeBuilder::new("enc")
+                    .attr("type", payload.enc_type.as_wire_str())
+                    .attr("v", "2")
+                    .bytes(payload.ciphertext.to_vec())
+                    .build()])
+                .build(),
+        )
     }
 
     async fn recover(&self) {
@@ -16607,7 +16749,7 @@ async fn pdo_retry_overlaps_durability_commit() {
 
 #[tokio::test]
 async fn pdo_retry_missing_group_key_recovers_on_phone_and_group_lanes() {
-    let fixture = PdoRetryFixture::new().await;
+    let mut fixture = PdoRetryFixture::new().await;
     let group = fixture
         .client
         .parse_message_info(fixture.retry.get())
@@ -16641,6 +16783,24 @@ async fn pdo_retry_missing_group_key_recovers_on_phone_and_group_lanes() {
         1,
         "decrypt failure must send one retry receipt alongside PDO"
     );
+
+    fixture.response.stanza_id = Some(
+        fixture
+            .client
+            .pdo_pending_requests
+            .get(&pending_key)
+            .await
+            .unwrap()
+            .1
+            .request_id
+            .clone(),
+    );
+    fixture.phone_response = PdoRetryFixture::encode_phone_response(
+        &mut fixture.phone,
+        &fixture.receiver,
+        &fixture.response,
+    )
+    .await;
 
     for node in [&fixture.phone_response, &fixture.retry] {
         let from = node.attrs().optional_jid("from").unwrap().to_non_ad();

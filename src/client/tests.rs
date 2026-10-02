@@ -3726,7 +3726,10 @@ async fn runtime_cache_config_honors_disabled_recent_cache() {
 /// a terminate must cancel an offer paused on identity learning. It retains
 /// only in-flight offers, and `memory_report()` exposes their count. The
 /// history-sync admission policy is an immutable optional `Arc`, so it avoids
-/// the synchronization-cell cost of the former `OnceLock` field.
+/// the synchronization-cell cost of the former `OnceLock` field. Dial admission
+/// adds a two-word optional trait-object Arc: measured 4384 -> 4400 B under
+/// default features at admission's intake, accounted separately without raising
+/// the fixed base.
 ///
 /// Rebaseline: the failure message prints the current size; set the base just
 /// above it. Test cfg only: `#[cfg(test)]` fields shift the number versus a
@@ -3743,7 +3746,12 @@ fn client_size_pins_runtime_cache_config_saving() {
     let mut expected = 4288
         + size_of::<subsystem::Subsystems>()
         + size_of::<crate::handlers::call::pending_offers::PendingOffers>()
-        + size_of::<Arc<std::sync::Mutex<crate::retry::HistoryPayloadRegistry>>>();
+        + size_of::<Arc<std::sync::Mutex<crate::retry::HistoryPayloadRegistry>>>()
+        + size_of::<Option<Arc<dyn crate::ConnectAdmission>>>();
+    assert_eq!(
+        size_of::<Option<Arc<dyn crate::ConnectAdmission>>>(),
+        2 * size_of::<usize>(),
+    );
     if cfg!(feature = "client-lifecycle") {
         expected += size_of::<std::sync::Mutex<()>>() + size_of::<Option<Arc<()>>>();
     }
@@ -6334,7 +6342,7 @@ async fn chatstate_bus_adapter_preserves_parsed_states_and_subscription_lifetime
             let chat = if group {
                 "120363000001@g.us"
             } else {
-                "15550002222@s.whatsapp.net"
+                "12025550102@s.whatsapp.net"
             };
             let mut state = NodeBuilder::new(tag);
             if let Some(media) = media {
@@ -6344,7 +6352,7 @@ async fn chatstate_bus_adapter_preserves_parsed_states_and_subscription_lifetime
                 .attr("from", chat)
                 .children([state.build()]);
             if group {
-                stanza = stanza.attr("participant", "15550003333@s.whatsapp.net");
+                stanza = stanza.attr("participant", "12025550103@s.whatsapp.net");
             }
             assert!(
                 ChatstateHandler
@@ -6360,7 +6368,7 @@ async fn chatstate_bus_adapter_preserves_parsed_states_and_subscription_lifetime
             assert_eq!(legacy_view.state, expected);
             assert_eq!(
                 legacy_view.participant.as_ref().map(ToString::to_string),
-                group.then(|| "15550003333@s.whatsapp.net".to_string())
+                group.then(|| "12025550103@s.whatsapp.net".to_string())
             );
             let Event::ChatPresence(update) = &*events.recv().await.unwrap() else {
                 panic!("chat presence")
@@ -6407,7 +6415,7 @@ async fn slow_callback_does_not_hold_chatstate_protocol_dispatch() {
     let _bus_subscription = client.subscribe_handler(bus);
     let node = crate::test_utils::node_to_owned_ref(
         &NodeBuilder::new("chatstate")
-            .attr("from", "15550002222@s.whatsapp.net")
+            .attr("from", "12025550102@s.whatsapp.net")
             .children([NodeBuilder::new("composing").build()])
             .build(),
     );
@@ -6475,7 +6483,7 @@ async fn central_reader_resolves_iq_while_event_callback_is_pending() {
     };
     let chatstate = || {
         NodeBuilder::new("chatstate")
-            .attr("from", "15550002222@s.whatsapp.net")
+            .attr("from", "12025550102@s.whatsapp.net")
             .children([NodeBuilder::new("composing").build()])
             .build()
     };
@@ -6511,6 +6519,12 @@ async fn central_reader_resolves_iq_while_event_callback_is_pending() {
         .unwrap()
         .unwrap();
     assert_eq!(response.tag(), "iq");
+    // IQ resolution is inline, but chatstate dispatch runs on independent tasks.
+    // Synchronize their counters only after reader progress has been proved.
+    crate::test_utils::poll_until("observer mailbox saturated", || {
+        callback.stats().dropped_full == 2
+    })
+    .await;
     assert_eq!(callback.stats().callbacks_active, 1);
     assert_eq!(callback.stats().dropped_full, 2);
     assert_eq!(client.stats().events_dropped, 2);

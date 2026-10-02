@@ -1955,6 +1955,9 @@ pub struct Client {
     pub(crate) retry_admission:
         std::sync::OnceLock<Arc<dyn crate::types::retry_admission::RetryAdmission>>,
 
+    /// Optional run-loop dial admission policy, fixed during assembly.
+    pub(crate) connect_admission:
+        Option<Arc<dyn crate::types::connect_admission::ConnectAdmission>>,
     /// Optional inbound history-sync admission policy, fixed during assembly.
     pub(crate) history_sync_admission:
         Option<Arc<dyn crate::types::history_sync_admission::HistorySyncAdmission>>,
@@ -1963,7 +1966,13 @@ pub struct Client {
     /// Handler storage and filtering belong exclusively to the core event bus.
     pub(crate) chatstate_handler_count: Arc<AtomicUsize>,
 
-    pub(crate) pdo_pending_requests: Cache<ChatMessageId, crate::pdo::PendingPdoRequest>,
+    pub(crate) pdo_pending_requests: Cache<
+        ChatMessageId,
+        (
+            crate::pdo::PendingPdoRequest,
+            Arc<crate::pdo::PdoRequestMemo>,
+        ),
+    >,
 
     /// Messages already covered by a placeholder-resend PDO request. Mirrors
     /// the session-lifetime set in
@@ -1976,7 +1985,9 @@ pub struct Client {
     /// is a purely local gate that never has to agree with anything the phone
     /// sends back, so it can name the message precisely; the pending map has
     /// to match a response and keeps the key the phone answers with.
-    pub(crate) pdo_requested: Cache<wacore::types::message::SenderMessageId, ()>,
+    pub(crate) pdo_requested:
+        Cache<wacore::types::message::SenderMessageId, Arc<crate::pdo::PdoRequestMemo>>,
+    pub(crate) pdo_explicit_published: AtomicBool,
 
     /// LRU cache for device registry (matches WhatsApp Web's 5000 entry limit).
     /// Maps user ID to DeviceListRecord for fast device existence checks.

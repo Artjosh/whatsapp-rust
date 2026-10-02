@@ -195,11 +195,11 @@ metrics = ["wacore/metrics"]
 # Render raw phone numbers in tracing fields instead of the redacted `pn#<hash>`.
 # Local debugging only; never enable in production.
 tracing-pii = ["wacore/tracing-pii", "wacore-binary/tracing-pii"]
-# Offline fixture for the client-level benchmarks (`benches/`). Not a public
+# Native fixtures for the client-level benchmarks (`benches/`). Not a public
 # API: the module it enables is `#[doc(hidden)]` and exists only so a bench
 # target, which links the crate from outside, can reach the crate-private send
 # internals it measures. Never enable it in a shipping build.
-bench-harness = ["tokio-runtime", "tokio/rt-multi-thread"]
+bench-harness = ["tokio-runtime", "tokio/rt-multi-thread", "dep:wacore-noise", "wacore-noise/test-util"]
 # Native integration fixtures only. Never enable in a shipping dependency.
 test-support = ["voip-runtime", "tokio-runtime", "dep:wacore-noise", "wacore-noise/test-util"]
 danger-skip-tls-verify = ["whatsapp-rust-tokio-transport?/danger-skip-tls-verify"]
@@ -341,6 +341,7 @@ cbc = { workspace = true, features = ["block-padding"] }
 # through `whatsapp-rust-sqlite-storage` in production.
 diesel = { workspace = true }
 divan = { workspace = true }
+dhat = "0.3"
 env_logger = { workspace = true }
 # URL parser for the benchmark example's mock admin endpoint derivation.
 # Dev-only so production builds carry no new dependency; already in the tree
@@ -391,6 +392,13 @@ required-features = ["tracing"]
 name = "metrics"
 required-features = ["metrics"]
 
+# Manual retained-heap diagnostic, kept out of CodSpeed's benchmark discovery.
+# Build with --profile bench to match the client_receive compiler settings.
+[[example]]
+name = "receive_footprint"
+test = false
+required-features = ["bench-harness"]
+
 # Client-level group-send sweep. `required-features` keeps the fixture out of
 # an ordinary `cargo bench`/`cargo build --all-targets`, which would otherwise
 # fail to find `whatsapp_rust::bench_support`.
@@ -403,6 +411,20 @@ required-features = ["bench-harness"]
 name = "client_receive"
 harness = false
 required-features = ["bench-harness"]
+
+[[bench]]
+name = "connected_idle"
+harness = false
+required-features = ["bench-harness", "sqlite-storage"]
+
+[[test]]
+name = "connected_idle_lifecycle"
+required-features = ["bench-harness"]
+
+[[example]]
+name = "connected_idle"
+test = true
+required-features = ["bench-harness", "sqlite-storage"]
 
 [[bench]]
 name = "client_dm_send"

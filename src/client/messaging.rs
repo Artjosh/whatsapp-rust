@@ -118,6 +118,22 @@ impl Client {
         self.send_raw_bytes(plaintext_buf).await
     }
 
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.node", level = "debug", skip_all, fields(tag = %node.tag), err(Debug)))]
+    pub(crate) async fn send_node_observed(
+        &self,
+        node: Node,
+        observer: Option<Box<dyn wacore::socket::noise_socket::SendObserver>>,
+    ) -> Result<(), ClientError> {
+        let plaintext = self.marshal_node_for_send(node)?;
+        wacore_binary::util::check_plain_payload(&plaintext).map_err(SocketError::Marshal)?;
+        let socket = self.get_noise_socket()?;
+        let receiver = socket
+            .enqueue_send_observed(plaintext.into(), observer)
+            .await?;
+        NoiseSocket::await_send(receiver).await?;
+        Ok(())
+    }
+
     /// Everything [`send_node`](Client::send_node) does short of the send:
     /// logging, waiter resolution and marshalling. Split out so a burst can
     /// marshal its whole batch before touching the socket, which is what keeps

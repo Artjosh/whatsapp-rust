@@ -204,6 +204,28 @@ impl Serialize for LazyHistorySync {
     }
 }
 
+// One declaration owns the enum and its authoritative public enumeration.
+macro_rules! event_kinds {
+    ($(#[$enum_attr:meta])* pub enum $name:ident {
+        $($(#[$variant_attr:meta])* $variant:ident,)*
+    }) => {
+        $(#[$enum_attr])*
+        pub enum $name {
+            $($(#[$variant_attr])* $variant,)*
+        }
+
+        impl $name {
+            /// All declared kinds in discriminant order, including retired slots.
+            ///
+            /// Hosts can walk this list to test their handling or registration
+            /// coverage when upgrading. New kinds are appended; matches still
+            /// require a wildcard because this enum is non-exhaustive.
+            pub const ALL: &'static [Self] = &[$(Self::$variant,)*];
+        }
+    };
+}
+
+event_kinds! {
 /// Discriminant for each [`Event`] variant, used to express handler interest
 /// without materializing the event. One per `Event` variant; the value doubles
 /// as a bit index in [`EventInterest`], so there can be at most 128 kinds.
@@ -297,9 +319,9 @@ pub enum EventKind {
     FavoritesUpdate,
     StatusPrivacyUpdate,
     ReachoutTimelockUpdate,
-    // When adding a variant, mind the 128-kind ceiling below (EventInterest packs
-    // each discriminant as a bit in a u128) and keep the guard pointing at the
-    // last variant.
+    CallLogHistory,
+    // Append new kinds here. The list and capacity guard are generated/derived.
+}
 }
 
 impl EventKind {
@@ -310,7 +332,19 @@ impl EventKind {
 
 // Build-time tripwire: a new variant that would overflow EventInterest's bitmask
 // fails compilation instead of silently corrupting the mask at runtime.
-const _: () = assert!((EventKind::ReachoutTimelockUpdate as u8) < EventKind::CAPACITY);
+const _: () = {
+    let kinds = EventKind::ALL;
+    assert!(!kinds.is_empty());
+    assert!(kinds.len() <= EventKind::CAPACITY as usize);
+    let last = kinds[kinds.len() - 1] as usize;
+    assert!(last < EventKind::CAPACITY as usize);
+    assert!(last == kinds.len() - 1);
+    let mut i = 0;
+    while i < kinds.len() {
+        assert!(kinds[i] as usize == i);
+        i += 1;
+    }
+};
 
 /// A set of [`EventKind`]s a handler wants delivered. Producers can query the
 /// aggregate interest before building expensive payloads, and dispatch avoids
@@ -1242,6 +1276,10 @@ pub enum Event {
     /// The server pushed account reachout restriction state. The raw
     /// [`Event::MexNotification`] is also delivered to interested consumers.
     ReachoutTimelockUpdate(ReachoutTimelockUpdate),
+
+    /// One call record from a successfully processed pairing-history chunk.
+    /// Distinct from the app-state mutation envelope in [`Event::CallLogSync`].
+    CallLogHistory(CallLogHistory),
 }
 
 /// Payload for [`Event::PairPasskeyRequest`].
@@ -1360,6 +1398,7 @@ impl Event {
             Event::ContactRemoved(_) => EventKind::ContactRemoved,
             Event::EncDecryptFailed(_) => EventKind::EncDecryptFailed,
             Event::CallLogSync(_) => EventKind::CallLogSync,
+            Event::CallLogHistory(_) => EventKind::CallLogHistory,
             Event::ClientExpirationChanged(_) => EventKind::ClientExpirationChanged,
             Event::OfflineSyncInterrupted(_) => EventKind::OfflineSyncInterrupted,
             Event::LockChatUpdate(_) => EventKind::LockChatUpdate,
@@ -2924,8 +2963,8 @@ pub struct ContactRemoved {
 
 /// A call placed or received on the primary device, synced through app state.
 ///
-/// The only channel that carries a call the companion never saw signalling for:
-/// a call placed on the phone puts nothing on this socket, so
+/// Together with [`CallLogHistory`], carries calls the companion never saw
+/// signalling for: a call placed on the phone puts nothing on this socket, so
 /// [`Event::IncomingCall`] and friends cannot see it.
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
@@ -2959,6 +2998,53 @@ pub struct CallLogSync {
     pub timestamp: DateTime<Utc>,
     pub record: Box<wa::CallLogRecord>,
     pub from_full_sync: bool,
+}
+
+/// A call record from the phone's pairing-time compressed history (field 13).
+///
+/// The record is shared with [`CallLogSync`], but history has no mutation index,
+/// mutation write time or app-state full-sync flag. This event is delivered in
+/// record wire order after the chunk's internal harvest and legacy
+/// [`Event::HistorySync`], so the new burst cannot displace that chunk in a
+/// bounded mailbox. Local retention limits may suppress all typed calls for an
+/// over-budget chunk; the raw lazy history remains available for recovery.
+/// It promises neither cross-chunk ordering nor dedup:
+/// replayed chunks can emit the same calls again. Consumers may upsert using
+/// the record's optional call identifier and creator.
+///
+/// ```
+/// use wacore::types::events::{CallLogHistory, Event, EventInterest, EventKind};
+/// let interest = EventInterest::of(&[EventKind::CallLogHistory]);
+/// assert!(interest.wants(EventKind::CallLogHistory));
+/// fn placed(event: &Event) -> Option<bool> {
+///     match event {
+///         Event::CallLogHistory(call) => call.from_me,
+///         _ => None,
+///     }
+/// }
+/// let event = Event::CallLogHistory(CallLogHistory::builder().record(Box::default()).build());
+/// assert_eq!(placed(&event), None);
+/// ```
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct CallLogHistory {
+    /// Who started the call, parsed only from `record.call_creator_jid`.
+    /// Absent or unparseable creators stay unknown; raw text stays in `record`.
+    pub call_creator_jid: Option<Jid>,
+    /// Whether this account placed the call, comparing the creator against
+    /// the chunk's fixed canonical PN/LID snapshot. `None` for an unknown
+    /// creator or when neither account identity is available.
+    /// `record.is_incoming` is never used to invent a direction.
+    pub from_me: Option<bool>,
+    /// The call's own `record.start_time` (Unix seconds), not a mutation's
+    /// write time. `None` when absent or out of range, without a now fallback.
+    pub timestamp: Option<DateTime<Utc>>,
+    /// All observed optional fields, outcomes and participants, unmodified.
+    pub record: Box<wa::CallLogRecord>,
+    /// History notification's sync type, not app-state full-sync provenance.
+    pub sync_type: Option<i32>,
+    /// History notification's chunk order, if supplied by the phone.
+    pub chunk_order: Option<u32>,
 }
 
 #[cfg(test)]
@@ -3003,6 +3089,22 @@ mod tests {
         assert_eq!(EventKind::FavoritesUpdate as u8, 74);
         assert_eq!(EventKind::StatusPrivacyUpdate as u8, 75);
         assert_eq!(EventKind::ReachoutTimelockUpdate as u8, 76);
+        assert_eq!(EventKind::CallLogHistory as u8, 77);
+    }
+
+    #[test]
+    fn event_kind_list_is_discriminant_ordered() {
+        assert_eq!(EventKind::ALL.len(), 78);
+        assert_eq!(EventKind::ALL.last(), Some(&EventKind::CallLogHistory));
+        assert!(EventKind::ALL.len() <= EventKind::CAPACITY as usize);
+        for (i, &kind) in EventKind::ALL.iter().enumerate() {
+            assert_eq!(kind as u8 as usize, i);
+            assert!(EventInterest::ALL.wants(kind));
+            assert!(EventInterest::of(&[kind]).wants(kind));
+        }
+        // ALL deliberately includes unknown/future bits, not just known kinds.
+        assert_eq!(EventInterest::ALL.0, u128::MAX);
+        assert_ne!(EventInterest::of(EventKind::ALL), EventInterest::ALL);
     }
 
     /// Every rejection a consumer can be handed must survive being persisted

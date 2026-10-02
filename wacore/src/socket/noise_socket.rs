@@ -120,11 +120,31 @@ impl std::error::Error for SharedSendFailure {
     }
 }
 
+/// Per-frame ownership transferred to the socket job, not to its waiter.
+/// Implementations can release an unsent/failed reservation in `Drop`.
+pub trait SendObserver: crate::sync_marker::MaybeSendSync {
+    /// Called immediately before the frame's transport write begins.
+    fn sending(&self);
+    /// Called after that write succeeds, even if the caller was cancelled.
+    fn sent(&self);
+}
+
 /// A job sent to the dedicated sender task.
 pub struct SendJob {
     pub plaintext: bytes::Bytes,
     pub response_tx: oneshot::Sender<SendResult>,
 }
+
+struct ObservedSendJob {
+    job: SendJob,
+    observer: Option<Box<dyn SendObserver>>,
+}
+
+type SendWaiter = (
+    oneshot::Sender<SendResult>,
+    usize,
+    Option<Box<dyn SendObserver>>,
+);
 
 /// Observer for plaintext frames sent over the wire before encryption.
 pub trait FrameTap: crate::sync_marker::MaybeSendSync + 'static {
@@ -184,7 +204,7 @@ pub struct NoiseSocket {
     /// Using a channel instead of a mutex avoids blocking callers while
     /// the current send is in progress - they can enqueue their work and
     /// await the result without holding a lock.
-    send_job_tx: async_channel::Sender<SendJob>,
+    send_job_tx: async_channel::Sender<ObservedSendJob>,
     /// Handle to the sender task. Aborted on drop to prevent resource leaks
     /// if the task is stuck on a slow/hanging network operation, and
     /// explicitly by [`NoiseSocket::abort_sender`] when teardown cannot wait
@@ -224,7 +244,7 @@ impl NoiseSocket {
         // Small buffer matched to typical steady-state throughput; the sender
         // task is network-bound (awaits `transport.send`), so a transient
         // WebSocket stall will backpressure producers here rather than queue.
-        let (send_job_tx, send_job_rx) = async_channel::bounded::<SendJob>(8);
+        let (send_job_tx, send_job_rx) = async_channel::bounded::<ObservedSendJob>(8);
 
         // Spawn the dedicated sender task
         let transport_clone = transport.clone();
@@ -253,7 +273,7 @@ impl NoiseSocket {
         runtime: Arc<dyn Runtime>,
         transport: Arc<dyn Transport>,
         write_key: Arc<NoiseCipher>,
-        send_job_rx: async_channel::Receiver<SendJob>,
+        send_job_rx: async_channel::Receiver<ObservedSendJob>,
         observers: SendObservers,
     ) {
         let SendObservers { stats, sent_frames } = observers;
@@ -274,12 +294,12 @@ impl NoiseSocket {
         let mut poisoned = false;
         // Reused across batches: one allocation for the life of the connection
         // instead of one per batch.
-        let mut waiters: Vec<(oneshot::Sender<SendResult>, usize)> = Vec::new();
+        let mut waiters: Vec<SendWaiter> = Vec::new();
         // A job pulled off the channel that would have overflowed the byte
         // ceiling, held over to open the next batch. Dropping it (on shutdown)
         // drops its response channel, which the caller sees as a closed sender:
         // a held-over job can be lost, but it can never hang its caller.
-        let mut carry_over: Option<SendJob> = None;
+        let mut carry_over: Option<ObservedSendJob> = None;
 
         // Plaintexts staged for the sent-frame tap, emptied into `tap.publish`
         // only once the transport write succeeds. Kept in a single Vec across
@@ -298,6 +318,7 @@ impl NoiseSocket {
             // Poison check before touching any frame in this batch.
             if poisoned {
                 let _ = first_job
+                    .job
                     .response_tx
                     .send(Err(EncryptSendError::poisoned()));
                 continue;
@@ -312,25 +333,32 @@ impl NoiseSocket {
 
             let mut job = first_job;
             loop {
-                let response_tx = job.response_tx;
+                let ObservedSendJob {
+                    job:
+                        SendJob {
+                            plaintext,
+                            response_tx,
+                        },
+                    observer,
+                } = job;
                 // Cloned before the plaintext is consumed, dropped again if the
                 // frame never makes it into the buffer.
                 let to_observe = match sent_frames.as_deref() {
-                    Some(tap) if tap.enabled() => Some(job.plaintext.clone()),
+                    Some(tap) if tap.enabled() => Some(plaintext.clone()),
                     _ => None,
                 };
                 match Self::encrypt_frame_into(
                     &runtime,
                     &write_key,
                     &mut write_counter,
-                    job.plaintext,
+                    plaintext,
                     &mut out_buf,
                 )
                 .await
                 {
                     Ok(wire_len) => {
                         batch_wire_len += wire_len;
-                        waiters.push((response_tx, wire_len));
+                        waiters.push((response_tx, wire_len, observer));
                         if let Some(plaintext) = to_observe {
                             observed.push(plaintext);
                         }
@@ -357,7 +385,7 @@ impl NoiseSocket {
                         // If appending this next frame would cross the byte
                         // ceiling, hold it over to open the next batch rather
                         // than encrypting it into this one.
-                        let estimated_wire = frame_wire_len(next.plaintext.len());
+                        let estimated_wire = frame_wire_len(next.job.plaintext.len());
                         if !waiters.is_empty()
                             && batch_wire_len + estimated_wire > MAX_BATCH_WIRE_BYTES
                         {
@@ -379,6 +407,11 @@ impl NoiseSocket {
                 if let Some(stats) = &stats {
                     stats.arm_dead_socket_deadline();
                 }
+                for (_, _, observer) in &waiters {
+                    if let Some(observer) = observer {
+                        observer.sending();
+                    }
+                }
                 transport.send(payload).await
             } else {
                 Ok(())
@@ -387,11 +420,14 @@ impl NoiseSocket {
             match transport_result {
                 Ok(()) => {
                     if let Some(stats) = &stats {
-                        for (_, wire_len) in &waiters {
+                        for (_, wire_len, _) in &waiters {
                             stats.record_frame_sent(*wire_len);
                         }
                     }
-                    for (response_tx, _) in waiters.drain(..) {
+                    for (response_tx, _, observer) in waiters.drain(..) {
+                        if let Some(observer) = observer {
+                            observer.sent();
+                        }
                         let _ = response_tx.send(Ok(()));
                     }
                     // Re-read the gate rather than trusting the read at
@@ -413,11 +449,12 @@ impl NoiseSocket {
                     transport.disconnect().await;
                     let err = EncryptSendError::transport(e);
                     if waiters.len() == 1 {
-                        let (response_tx, _) = waiters.drain(..).next().expect("length checked");
+                        let (response_tx, _, _observer) =
+                            waiters.drain(..).next().expect("length checked");
                         let _ = response_tx.send(Err(err));
                     } else {
                         let shared = Arc::new(err);
-                        for (response_tx, _) in waiters.drain(..) {
+                        for (response_tx, _, _observer) in waiters.drain(..) {
                             let _ = response_tx.send(Err(EncryptSendError::transport(
                                 SharedSendFailure(shared.clone()),
                             )));
@@ -498,15 +535,29 @@ impl NoiseSocket {
     }
 
     /// Enqueues a plaintext frame for encryption and send.
-    pub async fn enqueue_send(
+    pub fn enqueue_send(
         &self,
         plaintext: bytes::Bytes,
+    ) -> impl Future<Output = std::result::Result<oneshot::Receiver<SendResult>, EncryptSendError>> + '_
+    {
+        self.enqueue_send_observed(plaintext, None)
+    }
+
+    /// Like [`Self::enqueue_send`], retaining a per-frame observer until the
+    /// socket finishes or drops the job. A capacity wait is still cancellable.
+    pub async fn enqueue_send_observed(
+        &self,
+        plaintext: bytes::Bytes,
+        observer: Option<Box<dyn SendObserver>>,
     ) -> std::result::Result<oneshot::Receiver<SendResult>, EncryptSendError> {
         let (response_tx, response_rx) = oneshot::channel();
 
-        let job = SendJob {
-            plaintext,
-            response_tx,
+        let job = ObservedSendJob {
+            job: SendJob {
+                plaintext,
+                response_tx,
+            },
+            observer,
         };
 
         if let Err(_send_err) = self.send_job_tx.send(job).await {
