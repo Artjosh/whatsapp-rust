@@ -887,6 +887,7 @@ pub(crate) struct SendPipelineOptions<'a> {
     /// instead of handing over a copy.
     pub(crate) request_id: Option<&'a str>,
     pub(crate) peer: bool,
+    pub(crate) send_observer: Option<Box<dyn wacore::socket::noise_socket::SendObserver>>,
     pub(crate) edit: Option<EditAttribute>,
     pub(crate) extra_stanza_nodes: Vec<Node>,
     pub(crate) stanza_type: Option<StanzaType>,
@@ -2641,6 +2642,7 @@ impl Client {
             sent_at,
             request_id: request_id_override,
             peer,
+            send_observer,
             edit,
             extra_stanza_nodes,
             stanza_type: stanza_type_override,
@@ -2904,7 +2906,8 @@ impl Client {
             stanza_to_send.attrs.insert("type", t.as_wire());
         }
 
-        if let Err(e) = self.send_node(stanza_to_send).await {
+        let send = self.send_node_observed(stanza_to_send, send_observer).await;
+        if let Err(e) = send {
             if let Some(msg_id) = ack_message_id {
                 self.response_waiters_guard().remove(msg_id);
             }

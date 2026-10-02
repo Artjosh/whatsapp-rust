@@ -9,6 +9,7 @@ use hmac::Hmac;
 use hmac::Mac;
 use sha2::Sha256;
 use thiserror::Error;
+use wacore_binary::{Jid, JidExt};
 use waproto::whatsapp as wa;
 use waproto::whatsapp::ExternalBlobReference;
 use waproto::whatsapp::message::HistorySyncNotification;
@@ -59,6 +60,8 @@ pub enum MediaType {
     /// Opt-in group-history bundle shared on direct member adds.
     /// WA Web derives its media keys under the `Group History` HKDF context.
     GroupHistory,
+    MusicArtwork,
+    NewsletterMusicArtwork,
 }
 
 impl MediaType {
@@ -77,6 +80,9 @@ impl MediaType {
             MediaType::LinkThumbnail => "WhatsApp Link Thumbnail Keys",
             // Unencrypted: app_info unused, but keep a value for the type system.
             MediaType::ProductCatalogImage => "WhatsApp Image Keys",
+            MediaType::MusicArtwork | MediaType::NewsletterMusicArtwork => {
+                "WhatsApp Music Artwork Keys"
+            }
         }
     }
 
@@ -95,6 +101,8 @@ impl MediaType {
             MediaType::StickerPackThumbnail => "thumbnail-sticker-pack",
             MediaType::LinkThumbnail => "thumbnail-link",
             MediaType::ProductCatalogImage => "product-catalog-image",
+            MediaType::MusicArtwork => "music-artwork",
+            MediaType::NewsletterMusicArtwork => "newsletter-music-artwork",
         }
     }
 
@@ -112,13 +120,18 @@ impl MediaType {
             MediaType::StickerPackThumbnail => "/mms/thumbnail-sticker-pack",
             MediaType::LinkThumbnail => "/mms/thumbnail-link",
             MediaType::ProductCatalogImage => "/product/image",
+            MediaType::MusicArtwork => "/mms/music-artwork",
+            MediaType::NewsletterMusicArtwork => "/mms/newsletter-music-artwork",
         }
     }
 
     /// Whether this media type is encrypted (E2E).
-    /// Product catalog images are unencrypted per WA Web (CreateMediaKeys.js:75-76).
+    /// Product catalog images and newsletter artwork are unencrypted.
     pub fn is_encrypted(&self) -> bool {
-        !matches!(self, MediaType::ProductCatalogImage)
+        !matches!(
+            self,
+            MediaType::ProductCatalogImage | MediaType::NewsletterMusicArtwork
+        )
     }
 }
 
@@ -156,10 +169,14 @@ pub trait Downloadable: Sync + Send {
     }
 
     /// Whether this media requires decryption.
-    /// Returns `true` if `media_key` is present (E2EE media),
-    /// `false` otherwise (newsletter/channel media).
+    /// Artwork requires encryption unless its newsletter media type is explicit;
+    /// other media follows key presence.
     fn is_encrypted(&self) -> bool {
-        self.media_key().is_some()
+        match self.app_info() {
+            MediaType::MusicArtwork => true,
+            MediaType::NewsletterMusicArtwork => false,
+            _ => self.media_key().is_some(),
+        }
     }
 }
 
@@ -231,6 +248,78 @@ impl_downloadable!(
 );
 impl_downloadable!(ExternalBlobReference, MediaType::AppState, file_size_bytes);
 impl_downloadable!(HistorySyncNotification, MediaType::History, file_length);
+
+impl Downloadable for wa::EmbeddedMusic {
+    fn direct_path(&self) -> Option<&str> {
+        self.artwork_direct_path.as_deref()
+    }
+
+    fn media_key(&self) -> Option<&[u8]> {
+        self.artwork_media_key.as_deref()
+    }
+
+    fn file_enc_sha256(&self) -> Option<&[u8]> {
+        self.artwork_enc_sha256.as_deref()
+    }
+
+    fn file_sha256(&self) -> Option<&[u8]> {
+        self.artwork_sha256.as_deref()
+    }
+
+    fn file_length(&self) -> Option<u64> {
+        None
+    }
+
+    fn app_info(&self) -> MediaType {
+        MediaType::MusicArtwork
+    }
+}
+
+/// Artwork is plaintext only when its actual message chat is a newsletter.
+#[derive(Debug, Clone, Copy)]
+pub struct MusicArtwork<'a> {
+    metadata: &'a wa::EmbeddedMusic,
+    media_type: MediaType,
+}
+
+impl<'a> MusicArtwork<'a> {
+    pub fn for_chat(metadata: &'a wa::EmbeddedMusic, chat: &Jid) -> Self {
+        Self {
+            metadata,
+            media_type: if chat.is_newsletter() {
+                MediaType::NewsletterMusicArtwork
+            } else {
+                MediaType::MusicArtwork
+            },
+        }
+    }
+}
+
+impl Downloadable for MusicArtwork<'_> {
+    fn direct_path(&self) -> Option<&str> {
+        self.metadata.direct_path()
+    }
+
+    fn media_key(&self) -> Option<&[u8]> {
+        self.metadata.media_key()
+    }
+
+    fn file_enc_sha256(&self) -> Option<&[u8]> {
+        self.metadata.file_enc_sha256()
+    }
+
+    fn file_sha256(&self) -> Option<&[u8]> {
+        self.metadata.file_sha256()
+    }
+
+    fn file_length(&self) -> Option<u64> {
+        None
+    }
+
+    fn app_info(&self) -> MediaType {
+        self.media_type
+    }
+}
 
 /// A received group-history bundle carries the same download references as
 /// other media (direct path, media key, hashes) but no declared plaintext
@@ -839,6 +928,164 @@ mod tests {
     }
 
     #[test]
+    fn music_artwork_uses_the_fixed_hkdf_context_and_offsets() {
+        let key: [u8; 32] = std::array::from_fn(|i| i as u8);
+        let mut expanded = [0; 112];
+        crate::crypto::hkdf_sha256_into(
+            &key,
+            None,
+            MediaType::MusicArtwork.app_info().as_bytes(),
+            &mut expanded,
+        )
+        .unwrap();
+        let expected = hex::decode("7e8118adc593efbab3564bd1c11c16bf215fa9ee4b83c91b9878fbe04895379cbb30e875056436bf91a36f80c22be3ef8c3dd4822ed2140b4ded31e13bfded333e0ca74c166f6b46dd82cd39656a09c463d427103e1d14ef0f4ee035fcefa74d7d85b465c4d878f70a8cd03bbfdecb80").unwrap();
+        assert_eq!(expanded.as_slice(), expected);
+        let (iv, cipher, mac) =
+            DownloadUtils::get_media_keys(&key, MediaType::MusicArtwork).unwrap();
+        assert_eq!(iv.as_slice(), &expected[..16]);
+        assert_eq!(cipher.as_slice(), &expected[16..48]);
+        assert_eq!(mac.as_slice(), &expected[48..80]);
+        assert_eq!(MediaType::MusicArtwork.mms_type(), "music-artwork");
+        assert_eq!(MediaType::MusicArtwork.upload_path(), "/mms/music-artwork");
+    }
+
+    #[test]
+    fn music_artwork_downloads_and_rejects_wrong_hashes() {
+        let plaintext = b"synthetic music artwork";
+        let key = [7; 32];
+        let enc =
+            crate::upload::encrypt_media_with_key(plaintext, MediaType::MusicArtwork, Some(&key))
+                .unwrap();
+        let metadata = wa::EmbeddedMusic {
+            artwork_direct_path: Some("/mms/music-artwork/synthetic".into()),
+            artwork_media_key: Some(key.to_vec()),
+            artwork_sha256: Some(enc.file_sha256.to_vec()),
+            artwork_enc_sha256: Some(enc.file_enc_sha256.to_vec()),
+            ..Default::default()
+        };
+        assert_eq!(metadata.app_info(), MediaType::MusicArtwork);
+        assert_eq!(metadata.file_length(), None);
+        let requests =
+            DownloadUtils::prepare_download_requests(&metadata, &authenticated_route()).unwrap();
+        assert!(requests[0].url.contains(&format!(
+            "/mms/music-artwork/synthetic?auth=test-auth-token&token={}",
+            BASE64_URL_SAFE_NO_PAD.encode(enc.file_enc_sha256)
+        )));
+        assert!(
+            matches!(&requests[0].decryption, MediaDecryption::Encrypted { media_key, media_type: MediaType::MusicArtwork } if media_key == &key)
+        );
+        let mut output = Vec::new();
+        DownloadUtils::decrypt_stream_to_writer_with_hashes(
+            std::io::Cursor::new(enc.data_to_upload.as_slice()),
+            &key,
+            MediaType::MusicArtwork,
+            Some(&enc.file_enc_sha256),
+            Some(&enc.file_sha256),
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(output, plaintext);
+        for (encrypted_hash, plaintext_hash, expected_error) in [
+            (
+                [0; 32],
+                enc.file_sha256,
+                "SHA-256 mismatch for encrypted media bytes",
+            ),
+            (
+                enc.file_enc_sha256,
+                [0; 32],
+                "SHA-256 mismatch for decrypted media bytes",
+            ),
+        ] {
+            let error = DownloadUtils::decrypt_stream_to_writer_with_hashes(
+                std::io::Cursor::new(enc.data_to_upload.as_slice()),
+                &key,
+                MediaType::MusicArtwork,
+                Some(&encrypted_hash),
+                Some(&plaintext_hash),
+                &mut Vec::new(),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(expected_error), "{error}");
+        }
+    }
+
+    #[test]
+    fn music_artwork_missing_key_never_implies_plaintext() {
+        let mut metadata = wa::EmbeddedMusic {
+            artwork_direct_path: Some("/mms/music-artwork/synthetic".into()),
+            artwork_sha256: Some(vec![1; 32]),
+            artwork_enc_sha256: Some(vec![2; 32]),
+            ..Default::default()
+        };
+        let chat = "15551234567@s.whatsapp.net".parse().unwrap();
+        let artwork = MusicArtwork::for_chat(&metadata, &chat);
+        let raw = MockDownloadable {
+            direct_path: metadata.artwork_direct_path.clone(),
+            static_url: None,
+            media_key: None,
+            file_sha256: metadata.artwork_sha256.clone(),
+            file_enc_sha256: metadata.artwork_enc_sha256.clone(),
+            media_type: MediaType::MusicArtwork,
+        };
+        assert!(metadata.is_encrypted() && artwork.is_encrypted());
+        for downloadable in [
+            &metadata as &dyn Downloadable,
+            &artwork as &dyn Downloadable,
+            &raw as &dyn Downloadable,
+        ] {
+            assert!(
+                DownloadUtils::prepare_download_requests(downloadable, &authenticated_route())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Missing media_key")
+            );
+        }
+        metadata.artwork_media_key = Some(vec![7; 32]);
+        metadata.artwork_enc_sha256 = None;
+        assert!(
+            DownloadUtils::prepare_download_requests(&metadata, &authenticated_route())
+                .unwrap_err()
+                .to_string()
+                .contains("Missing file_enc_sha256")
+        );
+    }
+
+    #[test]
+    fn music_artwork_newsletter_context_uses_plaintext_and_its_own_route() {
+        use sha2::Digest;
+        let plaintext = b"synthetic newsletter artwork";
+        let hash = Sha256::digest(plaintext);
+        let metadata = wa::EmbeddedMusic {
+            artwork_direct_path: Some("/mms/newsletter-music-artwork/synthetic".into()),
+            artwork_sha256: Some(hash.to_vec()),
+            artwork_media_key: Some(vec![7; 32]),
+            ..Default::default()
+        };
+        let chat = Jid::newsletter("42");
+        let artwork = MusicArtwork::for_chat(&metadata, &chat);
+        assert!(!artwork.is_encrypted());
+        assert_eq!(artwork.app_info(), MediaType::NewsletterMusicArtwork);
+        assert_eq!(artwork.app_info().mms_type(), "newsletter-music-artwork");
+        assert_eq!(
+            artwork.app_info().upload_path(),
+            "/mms/newsletter-music-artwork"
+        );
+        let requests =
+            DownloadUtils::prepare_download_requests(&artwork, &authenticated_route()).unwrap();
+        assert!(
+            requests[0]
+                .url
+                .ends_with(&format!("token={}", BASE64_URL_SAFE_NO_PAD.encode(hash)))
+        );
+        assert!(
+            matches!(&requests[0].decryption, MediaDecryption::Plaintext { file_sha256 } if file_sha256 == hash.as_slice())
+        );
+        DownloadUtils::validate_plaintext_sha256(plaintext, &hash).unwrap();
+        assert!(DownloadUtils::validate_plaintext_sha256(plaintext, &[0; 32]).is_err());
+    }
+
+    #[test]
     fn group_history_uses_its_own_media_path_and_key_derivation_context() {
         assert_eq!(MediaType::GroupHistory.app_info(), "Group History");
         assert_eq!(MediaType::GroupHistory.mms_type(), "group-history");
@@ -1113,7 +1360,7 @@ mod tests {
     /// Every variant. The exhaustive match in
     /// `every_media_type_builds_urls_for_both_route_kinds` is what forces a new
     /// one to be named here instead of silently skipping the URL assertions.
-    const ALL_MEDIA_TYPES: [MediaType; 12] = [
+    const ALL_MEDIA_TYPES: [MediaType; 14] = [
         MediaType::Image,
         MediaType::Video,
         MediaType::Audio,
@@ -1126,6 +1373,8 @@ mod tests {
         MediaType::StickerPackThumbnail,
         MediaType::LinkThumbnail,
         MediaType::ProductCatalogImage,
+        MediaType::MusicArtwork,
+        MediaType::NewsletterMusicArtwork,
     ];
 
     fn encrypted_media_fixture(
@@ -1408,7 +1657,9 @@ mod tests {
                 | MediaType::StickerPack
                 | MediaType::StickerPackThumbnail
                 | MediaType::LinkThumbnail
-                | MediaType::ProductCatalogImage => {}
+                | MediaType::ProductCatalogImage
+                | MediaType::MusicArtwork
+                | MediaType::NewsletterMusicArtwork => {}
             }
 
             let d = MockDownloadable {
@@ -1419,7 +1670,11 @@ mod tests {
                 file_enc_sha256: Some(vec![3; 32]),
                 media_type,
             };
-            let token = BASE64_URL_SAFE_NO_PAD.encode([3u8; 32]);
+            let token = BASE64_URL_SAFE_NO_PAD.encode(if d.is_encrypted() {
+                [3u8; 32]
+            } else {
+                [2u8; 32]
+            });
 
             let authenticated =
                 DownloadUtils::prepare_download_requests(&d, &authenticated_route()).unwrap();

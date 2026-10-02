@@ -751,6 +751,7 @@ impl Client {
             chatstate_handler_count: Arc::new(AtomicUsize::new(0)),
             pdo_pending_requests: cache_config.pdo_pending_requests.build_with_ttl(),
             pdo_requested: cache_config.pdo_requested.build_with_ttl(),
+            pdo_explicit_published: AtomicBool::new(false),
             device_registry_cache: device_topology::DeviceRegistryCache::new(
                 cache_config.device_registry_cache.build_typed_ttl(
                     cache_config.cache_stores.device_registry_cache.clone(),

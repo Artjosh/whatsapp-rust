@@ -16105,10 +16105,14 @@ mod pdo_alias_tests {
                                 },
                                 ID.into(),
                             ),
-                            crate::pdo::PendingPdoRequest {
-                                message_info: info.clone(),
-                                requested_at: wacore::time::Instant::now(),
-                            },
+                            crate::pdo::test_pending(
+                                crate::pdo::PendingPdoRequest {
+                                    message_info: info.clone(),
+                                    requested_at: wacore::time::Instant::now(),
+                                },
+                                "SYNTHETIC_PDO_REQUEST",
+                                false,
+                            ),
                         )
                         .await;
                 }
@@ -16344,10 +16348,14 @@ mod pdo_alias_tests {
             .pdo_pending_requests
             .insert(
                 wacore::types::message::ChatMessageId::new(info.source.chat.clone(), ID.into()),
-                crate::pdo::PendingPdoRequest {
-                    message_info: info.clone(),
-                    requested_at: wacore::time::Instant::now(),
-                },
+                crate::pdo::test_pending(
+                    crate::pdo::PendingPdoRequest {
+                        message_info: info.clone(),
+                        requested_at: wacore::time::Instant::now(),
+                    },
+                    "SYNTHETIC_PDO_REQUEST",
+                    false,
+                ),
             )
             .await;
         retry(&client, &info).await;
@@ -16407,6 +16415,8 @@ struct PdoRetryFixture {
     phone_response: Arc<OwnedNodeRef>,
     response: wa::message::PeerDataOperationRequestResponseMessage,
     phone_info: MessageInfo,
+    phone: AlicePeer,
+    receiver: Jid,
 }
 
 impl PdoRetryFixture {
@@ -16488,10 +16498,14 @@ impl PdoRetryFixture {
             .pdo_pending_requests
             .insert(
                 wacore::types::message::ChatMessageId::new(group.clone(), Self::ID.into()),
-                crate::pdo::PendingPdoRequest {
-                    message_info: info,
-                    requested_at: wacore::time::Instant::now(),
-                },
+                crate::pdo::test_pending(
+                    crate::pdo::PendingPdoRequest {
+                        message_info: info,
+                        requested_at: wacore::time::Instant::now(),
+                    },
+                    "SYNTHETIC_PDO_REQUEST",
+                    false,
+                ),
             )
             .await;
         let recovered = wa::WebMessageInfo {
@@ -16534,29 +16548,7 @@ impl PdoRetryFixture {
             .session_state_mut()
             .unwrap()
             .clear_unacknowledged_pre_key_message();
-        let ciphertext = phone.encrypt(&receiver.to_protocol_address(), &MessageUtils::encode_and_pad(&wa::Message {
-            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
-                r#type: Some(wa::message::protocol_message::Type::PEER_DATA_OPERATION_REQUEST_RESPONSE_MESSAGE),
-                peer_data_operation_request_response_message: buffa::MessageField::some(response.clone()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        })).await;
-        let payload = enc_payload_from_ciphertext(&ciphertext);
-        let phone_response = node_to_arc(
-            NodeBuilder::new("message")
-                .attr("from", phone.jid)
-                .attr("id", "SYNTHETIC_PDO_RESPONSE")
-                .attr("type", "text")
-                .attr("category", "peer")
-                .attr("t", wacore::time::now_secs().to_string())
-                .children([NodeBuilder::new("enc")
-                    .attr("type", payload.enc_type.as_wire_str())
-                    .attr("v", "2")
-                    .bytes(payload.ciphertext.to_vec())
-                    .build()])
-                .build(),
-        );
+        let phone_response = Self::encode_phone_response(&mut phone, &receiver, &response).await;
         let phone_info = client
             .parse_message_info(phone_response.get())
             .await
@@ -16573,7 +16565,39 @@ impl PdoRetryFixture {
             phone_response,
             response,
             phone_info,
+            phone,
+            receiver,
         }
+    }
+
+    async fn encode_phone_response(
+        phone: &mut AlicePeer,
+        receiver: &Jid,
+        response: &wa::message::PeerDataOperationRequestResponseMessage,
+    ) -> Arc<OwnedNodeRef> {
+        let ciphertext = phone.encrypt(&receiver.to_protocol_address(), &MessageUtils::encode_and_pad(&wa::Message {
+            protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+                r#type: Some(wa::message::protocol_message::Type::PEER_DATA_OPERATION_REQUEST_RESPONSE_MESSAGE),
+                peer_data_operation_request_response_message: buffa::MessageField::some(response.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })).await;
+        let payload = enc_payload_from_ciphertext(&ciphertext);
+        node_to_arc(
+            NodeBuilder::new("message")
+                .attr("from", phone.jid.clone())
+                .attr("id", "SYNTHETIC_PDO_RESPONSE")
+                .attr("type", "text")
+                .attr("category", "peer")
+                .attr("t", wacore::time::now_secs().to_string())
+                .children([NodeBuilder::new("enc")
+                    .attr("type", payload.enc_type.as_wire_str())
+                    .attr("v", "2")
+                    .bytes(payload.ciphertext.to_vec())
+                    .build()])
+                .build(),
+        )
     }
 
     async fn recover(&self) {
@@ -16724,7 +16748,7 @@ async fn pdo_retry_overlaps_durability_commit() {
 
 #[tokio::test]
 async fn pdo_retry_missing_group_key_recovers_on_phone_and_group_lanes() {
-    let fixture = PdoRetryFixture::new().await;
+    let mut fixture = PdoRetryFixture::new().await;
     let group = fixture
         .client
         .parse_message_info(fixture.retry.get())
@@ -16758,6 +16782,24 @@ async fn pdo_retry_missing_group_key_recovers_on_phone_and_group_lanes() {
         1,
         "decrypt failure must send one retry receipt alongside PDO"
     );
+
+    fixture.response.stanza_id = Some(
+        fixture
+            .client
+            .pdo_pending_requests
+            .get(&pending_key)
+            .await
+            .unwrap()
+            .1
+            .request_id
+            .clone(),
+    );
+    fixture.phone_response = PdoRetryFixture::encode_phone_response(
+        &mut fixture.phone,
+        &fixture.receiver,
+        &fixture.response,
+    )
+    .await;
 
     for node in [&fixture.phone_response, &fixture.retry] {
         let from = node.attrs().optional_jid("from").unwrap().to_non_ad();
