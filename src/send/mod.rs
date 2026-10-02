@@ -40,6 +40,9 @@ mod tctoken_lifecycle;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum SendError {
+    /// Invalid or incomplete target addressing, rejected before sending.
+    #[error("{0}")]
+    MessageRef(#[from] crate::MessageRefError),
     /// Connection/transport/IQ failure (embeds the shared base error).
     // No `#[from]`: the manual `From<ClientError>` impl flattens a bare `?` so
     // `NotLoggedIn`/`Iq` stay matchable instead of nesting under `Client(..)`.
@@ -970,6 +973,37 @@ pub struct SendResult {
 }
 
 impl SendResult {
+    /// Reference the emitted message, not the original target of an edit,
+    /// revoke or add-on. Its body stays in the existing Arc, untouched. For
+    /// newsletter plaintext sends use `newsletter_ref` instead.
+    pub fn message_ref(&self) -> Result<crate::MessageRef<'_>, crate::MessageRefError> {
+        crate::MessageRef::new(
+            &self.to,
+            crate::MessageId::new(&self.message_id)?,
+            None,
+            true,
+        )
+    }
+
+    /// A freshly sent newsletter post has a client id but no server id until
+    /// learned from the server. This result does not manufacture that id.
+    pub fn newsletter_ref(
+        &self,
+    ) -> Result<crate::NewsletterMessageRef<'_>, crate::MessageRefError> {
+        crate::NewsletterMessageRef::new(
+            &self.to,
+            Some(crate::MessageId::new(&self.message_id)?),
+            None,
+        )
+        .map(|r| r.with_from_me(true))
+    }
+
+    /// Outer operation id for ACK correlation. For edits/revokes this is NOT
+    /// the original target id; an ACK match does not prove recipient delivery.
+    pub fn stanza_id(&self) -> Result<crate::StanzaId, crate::MessageRefError> {
+        crate::StanzaId::new(&self.message_id)
+    }
+
     /// `participant` is `None` -- only valid for the sender's own messages.
     pub fn message_key(&self) -> wa::MessageKey {
         wa::MessageKey {
@@ -3967,6 +4001,7 @@ pub(crate) fn dm_stanza_to(recipient_bare: &Jid, to: &Jid) -> Jid {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[allow(clippy::disallowed_methods)]
 mod tests {
+    mod message_reference_tests;
     use super::*;
     use crate::test_utils::wait_for_lock_waiter;
     use std::str::FromStr;

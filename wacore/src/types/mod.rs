@@ -4,6 +4,7 @@ pub mod group_call;
 pub mod jid;
 pub mod lid_pn;
 pub mod message;
+pub mod message_ref;
 pub mod presence;
 pub mod spam_report;
 pub mod user;

@@ -198,6 +198,30 @@ impl MessageContext {
         )
     }
 
+    /// Borrow the received message's addressing and inbound metadata. No
+    /// protobuf or origin metadata is cloned.
+    pub fn message_ref(&self) -> Result<crate::MessageRef<'_>, crate::MessageRefError> {
+        crate::MessageRef::from_info(&self.info).map(|r| {
+            r.with_inbound_metadata(self.ephemeral_expiration, self.comment_target.as_deref())
+        })
+    }
+
+    /// Borrow newsletter addressing; client and server ids remain independent.
+    pub fn newsletter_ref(
+        &self,
+    ) -> Result<crate::NewsletterMessageRef<'_>, crate::MessageRefError> {
+        crate::NewsletterMessageRef::new(
+            &self.info.source.chat,
+            (!self.info.id.is_empty())
+                .then(|| crate::MessageId::new(self.info.id.as_str()))
+                .transpose()?,
+            self.info
+                .newsletter_server_id
+                .map(crate::ServerMessageId::new),
+        )
+        .map(|r| r.with_from_me(self.info.source.is_from_me))
+    }
+
     /// Referential [`wa::MessageKey`] for [`wa::message::ReactionMessage::key`].
     /// Sender-side revokes have a different shape; use [`Client::revoke_message`].
     pub fn message_key(&self) -> wa::MessageKey {
@@ -246,7 +270,7 @@ impl MessageContext {
         emoji: &str,
     ) -> Result<crate::send::SendResult, crate::send::SendError> {
         self.client
-            .send_reaction(&self.info.source.chat, self.message_key(), emoji)
+            .send_reaction_ref(&self.message_ref()?, emoji)
             .await
     }
 }

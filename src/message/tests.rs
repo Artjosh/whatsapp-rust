@@ -3334,6 +3334,7 @@ fn create_test_message_info(chat: &str, msg_id: &str, sender: &str) -> MessageIn
     MessageInfo {
         id: msg_id.into(),
         server_id: 0,
+        newsletter_server_id: None,
         r#type: Some(wacore::types::message::StanzaMessageType::Text),
         source: MessageSource {
             chat: chat_jid.clone(),

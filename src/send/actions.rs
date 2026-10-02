@@ -1,6 +1,63 @@
 use super::*;
 
 impl Client {
+    /// Revoke using the original author/from-me scope. Own messages use a
+    /// sender revoke (no participant); other authors require group admin
+    /// rights, checked by the server. The reference grants no permissions.
+    pub async fn revoke_message_ref(
+        &self,
+        target: &crate::MessageRef<'_>,
+    ) -> Result<SendResult, SendError> {
+        target.require_chat_operation()?;
+        let kind = if target.from_me() {
+            RevokeType::Sender
+        } else {
+            if !target.chat().is_group() {
+                return Err(crate::MessageRefError::UnsupportedOrigin.into());
+            }
+            RevokeType::Admin {
+                original_sender: target
+                    .sender()
+                    .ok_or(crate::MessageRefError::MissingSender)?
+                    .clone(),
+            }
+        };
+        self.revoke_message(target.chat(), target.id().as_str(), kind)
+            .await
+    }
+
+    /// Keep/unkeep the addressed message. The raw chat/key overload remains
+    /// available as `keep_message` for advanced hosts.
+    pub async fn keep_message_ref(
+        &self,
+        target: &crate::MessageRef<'_>,
+        keep: bool,
+    ) -> Result<SendResult, SendError> {
+        target.require_chat_operation()?;
+        self.keep_message(target.chat(), target.to_raw_key(), keep)
+            .await
+    }
+
+    /// Pin the addressed message with a fresh operation id.
+    pub async fn pin_message_ref(
+        &self,
+        target: &crate::MessageRef<'_>,
+        duration: PinDuration,
+    ) -> Result<SendResult, SendError> {
+        target.require_chat_operation()?;
+        self.pin_message(target.chat(), target.to_raw_key(), duration)
+            .await
+    }
+
+    /// Unpin the addressed message with a fresh operation id.
+    pub async fn unpin_message_ref(
+        &self,
+        target: &crate::MessageRef<'_>,
+    ) -> Result<SendResult, SendError> {
+        target.require_chat_operation()?;
+        self.unpin_message(target.chat(), target.to_raw_key()).await
+    }
+
     /// Delete a message for everyone in the chat (revoke).
     ///
     /// This sends a revoke protocol message that removes the message for all participants.

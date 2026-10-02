@@ -1047,6 +1047,41 @@ impl Client {
         Ok(())
     }
 
+    /// Mark one referenced incoming message read, deriving the receipt's
+    /// participant from its origin. Raw batched receipts remain available via
+    /// `mark_as_read`. Own-message references are rejected before sending.
+    pub async fn mark_message_read(
+        &self,
+        target: &crate::MessageRef<'_>,
+    ) -> Result<(), anyhow::Error> {
+        if target.from_me() {
+            return Err(crate::MessageRefError::ExpectedIncoming.into());
+        }
+        self.mark_as_read(
+            target.chat(),
+            target.receipt_sender(),
+            &[target.id().as_str()],
+        )
+        .await
+    }
+
+    /// Mark one referenced incoming voice/video message played. This validates
+    /// addressing, not its media body; raw batching uses `mark_as_played`.
+    pub async fn mark_message_played(
+        &self,
+        target: &crate::MessageRef<'_>,
+    ) -> Result<(), anyhow::Error> {
+        if target.from_me() {
+            return Err(crate::MessageRefError::ExpectedIncoming.into());
+        }
+        self.mark_as_played(
+            target.chat(),
+            target.receipt_sender(),
+            &[target.id().as_str()],
+        )
+        .await
+    }
+
     /// Sends read receipts for one or more messages.
     ///
     /// For group messages, pass the message sender as `sender`.

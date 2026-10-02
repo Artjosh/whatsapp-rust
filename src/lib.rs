@@ -165,6 +165,9 @@ pub use wacore::appstate::schemas;
 pub use wacore::client_profile::ClientProfile;
 /// Optional metrics emission (the `metrics` feature). No-op when the feature is off.
 pub use wacore::telemetry;
+pub use wacore::types::message_ref::{
+    MessageId, MessageRef, MessageRefError, NewsletterMessageRef, ServerMessageId, StanzaId,
+};
 pub use wacore::{
     iq::privacy as privacy_settings, proto_helpers, sticker_pack, store::traits, webp,
 };
@@ -414,6 +417,9 @@ pub mod prelude {
     };
     pub use crate::types::message::MessageInfo;
     pub use crate::{Jid, Server};
+    pub use crate::{
+        MessageId, MessageRef, MessageRefError, NewsletterMessageRef, ServerMessageId, StanzaId,
+    };
     pub use wacore::proto_helpers::{MessageBuilderExt, MessageExt};
     /// Optional sub-message wrapper in `wa::Message` literals.
     pub use waproto::buffa::MessageField;

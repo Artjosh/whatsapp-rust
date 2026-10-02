@@ -1021,6 +1021,7 @@ impl Client {
         Ok(MessageInfo {
             id: id.unwrap_or_default().into(),
             server_id: 0,
+            newsletter_server_id: None,
             r#type: None,
             source: MessageSource {
                 chat: remote_jid,

@@ -159,6 +159,20 @@ impl Client {
         }
     }
 
+    /// Edit the content addressed by an own-message reference. The emitted
+    /// edit has a separate stanza id. The string/chat overload `edit_message`
+    /// remains the raw compatibility escape.
+    pub async fn edit_message_ref(
+        &self,
+        target: &crate::MessageRef<'_>,
+        new_content: wa::Message,
+    ) -> Result<crate::send::SendResult, crate::send::SendError> {
+        target.require_chat_operation()?;
+        target.require_own()?;
+        self.edit_message(target.chat(), target.id().as_str(), new_content)
+            .await
+    }
+
     /// Edit a message you own (`original_id`), replacing its content with
     /// `new_content`.
     ///

@@ -66,6 +66,9 @@ pub fn message_range(
     }
 }
 
+/// Raw key construction for advanced hosts. Prefer
+/// [`crate::MessageRef::to_raw_key`] to retain received author/from-me scope;
+/// sender revokes and group edits must still use their operation-specific APIs.
 pub fn message_key(
     id: impl Into<String>,
     remote_jid: &Jid,

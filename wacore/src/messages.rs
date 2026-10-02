@@ -1484,8 +1484,13 @@ pub fn parse_message_info(
         .optional_string(MessageAttr::Type)
         .map(|s| StanzaMessageType::from(s.as_ref()));
 
-    let server_id = attrs
-        .optional_u64(MessageAttr::ServerId)
+    let parsed_server_id = attrs.optional_u64(MessageAttr::ServerId);
+    let newsletter_server_id = source
+        .chat
+        .is_newsletter()
+        .then_some(parsed_server_id)
+        .flatten();
+    let server_id = parsed_server_id
         .filter(|&v| (99..=2_147_476_647).contains(&v))
         .unwrap_or(0) as i32;
 
@@ -1606,6 +1611,7 @@ pub fn parse_message_info(
         source,
         id,
         server_id,
+        newsletter_server_id,
         r#type: stanza_type,
         push_name,
         timestamp,

@@ -16,6 +16,21 @@ use crate::client::Client;
 use crate::send::{SendError, SendResult};
 
 impl Client {
+    /// React using the message's chat/author scope. Newsletter reactions use
+    /// `newsletter().send_reaction_ref`; the raw chat/key overload remains
+    /// available as `send_reaction` for advanced hosts.
+    pub async fn send_reaction_ref(
+        &self,
+        target: &crate::MessageRef<'_>,
+        emoji: &str,
+    ) -> Result<SendResult, SendError> {
+        let mut key = target.to_raw_key();
+        if target.chat().is_status_broadcast() && key.participant.is_none() {
+            key.participant = Some(self.pn().ok_or(SendError::NotLoggedIn)?.to_non_ad_string());
+        }
+        self.send_reaction(target.chat(), key, emoji).await
+    }
+
     /// React to a DM, group, or status@broadcast message.
     ///
     /// `target_key` references the message being reacted to. For groups and
