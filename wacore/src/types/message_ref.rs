@@ -242,7 +242,9 @@ impl<'a> MessageRef<'a> {
 
     /// Explicit referential key escape for add-ons/app-state. This is NOT an
     /// edit/revoke key: a sender revoke omits participant, while a group edit
-    /// needs our chat-specific identity even if a send result lacks it.
+    /// needs our chat-specific identity even if a send result lacks it. Own
+    /// group references can omit `participant` here; typed client add-on
+    /// operations resolve it without changing the borrowed reference.
     pub fn to_raw_key(&self) -> wa::MessageKey {
         let needs_sender = self.chat.is_group()
             || self.chat.is_status_broadcast()
@@ -337,6 +339,7 @@ impl<'a> NewsletterMessageRef<'a> {
             from_me: None,
         })
     }
+    /// Explicit caller declaration of ownership, not inferred envelope provenance.
     pub fn with_from_me(mut self, from_me: bool) -> Self {
         self.from_me = Some(from_me);
         self

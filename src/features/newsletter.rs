@@ -912,9 +912,6 @@ impl<'a> Newsletter<'a> {
         server_id: u64,
         reaction: &str,
     ) -> Result<String, NewsletterError> {
-        if !jid.is_newsletter() {
-            return Err(crate::MessageRefError::ExpectedNewsletter.into());
-        }
         self.client
             .send_server_reaction(jid, server_id, reaction)
             .await
@@ -2730,6 +2727,31 @@ mod tests {
 
         let msgs = parse_newsletter_messages_response(&response.as_node_ref()).unwrap();
         assert_eq!(msgs[0].message_type, NewsletterMessageType::Media);
+    }
+
+    #[test]
+    fn review_parsed_history_reference_preserves_known_ownership() {
+        let chat = newsletter_jid();
+        for is_sender in [false, true] {
+            let response = history_response(vec![
+                NodeBuilder::new("message")
+                    .attr("id", "HISTORY_CLIENT_CONTENT")
+                    .attr("server_id", u64::MAX)
+                    .attr("t", "123")
+                    .attr("is_sender", if is_sender { "true" } else { "false" })
+                    .build(),
+            ]);
+            let messages = parse_newsletter_messages_response(&response.as_node_ref()).unwrap();
+            assert_eq!(messages.len(), 1);
+            let target = messages[0].message_ref(&chat).unwrap();
+            assert_eq!(target.from_me(), Some(is_sender));
+            assert_eq!(
+                target.message_id().unwrap().as_str(),
+                "HISTORY_CLIENT_CONTENT"
+            );
+            assert_eq!(target.server_id().unwrap().get(), u64::MAX);
+            assert!(std::ptr::eq(target.chat(), &chat));
+        }
     }
 
     /// Wrap message nodes in the `<iq><messages>` envelope the server answers

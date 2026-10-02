@@ -64,6 +64,8 @@ fn newsletter_envelope_reference_preserves_numbers_and_absence() {
         let reference = message.newsletter_ref().unwrap();
         assert_eq!(reference.message_id().unwrap().as_str(), "CLIENT_CONTENT");
         assert_eq!(reference.server_id().map(ServerMessageId::get), value);
+        assert_eq!(reference.from_me(), None);
+        assert!(!message.info.source.is_from_me);
         assert_eq!(
             message.message_ref().unwrap_err(),
             MessageRefError::ExpectedChat

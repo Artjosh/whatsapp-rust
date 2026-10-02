@@ -765,6 +765,551 @@ async fn group_reference_operations_encrypt_operation_specific_keys() {
     }
 }
 
+async fn cache_group_subtype(fixture: &GroupSendFixture, flag: Option<bool>) {
+    let mut routing = (*fixture
+        .client
+        .get_group_cache()
+        .get(&fixture.group)
+        .await
+        .unwrap())
+    .clone();
+    routing.is_community_announce = flag;
+    fixture
+        .client
+        .get_group_cache()
+        .insert(fixture.group.clone(), Arc::new(routing))
+        .await;
+}
+
+#[tokio::test]
+async fn review_broadcast_list_reaction_rejects_before_identity_or_send() {
+    let (client, transport) = crate::test_utils::create_iq_test_client().await;
+    client
+        .persistence_manager
+        .process_command(DeviceCommand::SetId(None))
+        .await;
+    let chat: Jid = "123456789@broadcast".parse().unwrap();
+    assert!(chat.is_broadcast_list());
+    assert!(!chat.is_status_broadcast());
+    let target =
+        MessageRef::new(&chat, MessageId::new("LIST_TARGET").unwrap(), None, true).unwrap();
+    assert!(matches!(
+        client.send_reaction_ref(&target, "👍").await,
+        Err(SendError::MessageRef(MessageRefError::UnsupportedOrigin))
+    ));
+    assert_eq!(transport.sent_count(), 0);
+}
+
+#[tokio::test]
+async fn review_cached_cag_typed_edit_rejects_without_message_send() {
+    let fixture = GroupSendFixture::new().await;
+    cache_group_subtype(&fixture, Some(true)).await;
+    let target = MessageRef::new(
+        &fixture.group,
+        MessageId::new("OWN_CAG_TARGET").unwrap(),
+        None,
+        true,
+    )
+    .unwrap();
+    assert!(matches!(
+        fixture
+            .client
+            .edit_message_ref(&target, wa::Message::text("changed"))
+            .await,
+        Err(SendError::InvalidRequest(_))
+    ));
+    assert_eq!(fixture.transport.sent_count(), 0);
+}
+
+#[tokio::test]
+async fn review_live_newsletter_context_does_not_infer_ownership() {
+    let (client, _) = crate::test_utils::create_iq_test_client().await;
+    let own: Jid = "15550000001@s.whatsapp.net".parse().unwrap();
+    let node = NodeBuilder::new("message")
+        .attr("from", "120363000000000001@newsletter")
+        .attr("id", "LIVE_CLIENT_CONTENT")
+        .attr("server_id", 0u64)
+        .attr("t", "123")
+        .build();
+    let parsed = wacore::messages::parse_message_info(&node.as_node_ref(), &own, None).unwrap();
+    assert!(!parsed.source.is_from_me);
+    let inbound = InboundMessage::builder()
+        .info(Arc::new(parsed))
+        .message(Arc::new(wa::Message::default()))
+        .build();
+    let context = crate::bot::MessageContext::from_inbound(&inbound, client);
+    for (target, owner_chat) in [
+        (inbound.newsletter_ref().unwrap(), &inbound.info.source.chat),
+        (context.newsletter_ref().unwrap(), &context.info.source.chat),
+    ] {
+        assert_eq!(target.from_me(), None);
+        assert_eq!(target.message_id().unwrap().as_str(), "LIVE_CLIENT_CONTENT");
+        assert_eq!(target.server_id().unwrap().get(), 0);
+        assert!(std::ptr::eq(target.chat(), owner_chat));
+        assert_eq!(target.chat(), &inbound.info.source.chat);
+    }
+}
+
+#[tokio::test]
+async fn review_raw_newsletter_reaction_preserves_status_delegation() {
+    let (client, transport) = crate::test_utils::create_iq_test_client().await;
+    let chat = Jid::status_broadcast();
+    let id = client
+        .newsletter()
+        .send_reaction(&chat, 42, "👍")
+        .await
+        .unwrap();
+    let node = crate::test_utils::decode_sent_iq(&transport, 0).await;
+    assert_eq!(node.get().tag, "message");
+    assert_eq!(node.get().attrs().optional_jid("to"), Some(chat.clone()));
+    assert_eq!(node.get().attrs().optional_u64("server_id"), Some(42));
+    assert_eq!(
+        node.get().attrs().optional_string("id").as_deref(),
+        Some(id.as_str())
+    );
+    assert_eq!(
+        node.get()
+            .get_optional_child("reaction")
+            .unwrap()
+            .attrs()
+            .optional_string("code")
+            .as_deref(),
+        Some("👍")
+    );
+    assert_eq!(
+        NewsletterMessageRef::new(&chat, None, Some(ServerMessageId::new(42))).unwrap_err(),
+        MessageRefError::ExpectedNewsletter
+    );
+    assert_eq!(transport.sent_count(), 1);
+}
+
+#[tokio::test]
+async fn review_own_group_send_reference_keys_encrypt_original_author() {
+    use wacore::libsignal::protocol::{
+        create_sender_key_distribution_message, group_decrypt,
+        process_sender_key_distribution_message,
+    };
+    use wacore::libsignal::store::sender_key_name::SenderKeyName;
+    for fixture in [
+        GroupSendFixture::new().await,
+        GroupSendFixture::new_lid(2).await,
+    ] {
+        cache_group_subtype(&fixture, Some(false)).await;
+        let content = fixture
+            .client
+            .send_message(&fixture.group, wa::Message::text("own original"))
+            .await
+            .unwrap();
+        let target = content.message_ref().unwrap();
+        assert!(target.from_me());
+        assert_eq!(target.sender(), None);
+        assert_eq!(target.to_raw_key().participant, None);
+        assert!(std::ptr::eq(target.chat(), &content.to));
+        assert_eq!(Arc::strong_count(&content.message), 1);
+        let receiver = crate::test_utils::create_test_client().await;
+        let name = SenderKeyName::from_parts(
+            &fixture.group.to_string(),
+            fixture.own_sending.to_protocol_address().as_str(),
+        );
+        let mut sender_stores = fixture.client.signal_adapter();
+        let mut receiver_stores = receiver.signal_adapter();
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let distribution = create_sender_key_distribution_message(
+            &name,
+            &mut sender_stores.sender_key_store,
+            &mut rng,
+        )
+        .await
+        .unwrap();
+        process_sender_key_distribution_message(
+            &name,
+            &distribution,
+            &mut receiver_stores.sender_key_store,
+        )
+        .await
+        .unwrap();
+        let results = [
+            fixture
+                .client
+                .edit_message_ref(&target, wa::Message::text("edited"))
+                .await
+                .unwrap(),
+            fixture.client.revoke_message_ref(&target).await.unwrap(),
+            fixture
+                .client
+                .send_reaction_ref(&target, "👍")
+                .await
+                .unwrap(),
+            fixture
+                .client
+                .pin_message_ref(&target, PinDuration::Days7)
+                .await
+                .unwrap(),
+            fixture.client.unpin_message_ref(&target).await.unwrap(),
+            fixture
+                .client
+                .keep_message_ref(&target, true)
+                .await
+                .unwrap(),
+            fixture
+                .client
+                .keep_message_ref(&target, false)
+                .await
+                .unwrap(),
+        ];
+        let nodes = transport_nodes(&fixture.transport);
+        for (index, result) in results.iter().enumerate() {
+            let node = sent_message(&nodes, result);
+            let enc = node.get().get_optional_child("enc").unwrap();
+            assert_eq!(
+                enc.attrs().optional_string("type").as_deref(),
+                Some("skmsg")
+            );
+            let padded = group_decrypt(
+                enc.content_bytes().unwrap(),
+                &mut receiver_stores.sender_key_store,
+                &name,
+            )
+            .await
+            .unwrap();
+            let decoded = waproto::codec::message_decode(
+                &wacore::messages::unpad_plaintext(padded, 2).unwrap(),
+            )
+            .unwrap();
+            let kind = match index {
+                0 | 1 => index,
+                2 => 2,
+                3 | 4 => 3,
+                5 | 6 => 4,
+                _ => unreachable!(),
+            };
+            let decoded_key = match kind {
+                0 | 1 => decoded
+                    .protocol_message
+                    .as_option()
+                    .unwrap()
+                    .key
+                    .as_option()
+                    .unwrap(),
+                2 => decoded
+                    .reaction_message
+                    .as_option()
+                    .unwrap()
+                    .key
+                    .as_option()
+                    .unwrap(),
+                3 => decoded
+                    .pin_in_chat_message
+                    .as_option()
+                    .unwrap()
+                    .key
+                    .as_option()
+                    .unwrap(),
+                4 => decoded
+                    .keep_in_chat_message
+                    .as_option()
+                    .unwrap()
+                    .key
+                    .as_option()
+                    .unwrap(),
+                _ => unreachable!(),
+            };
+            assert_eq!(decoded_key, operation_key(result, kind));
+            assert_eq!(decoded_key.id.as_deref(), Some(content.message_id.as_str()));
+            assert_ne!(decoded_key.id.as_deref(), Some(result.message_id.as_str()));
+            assert_eq!(decoded_key.remote_jid, Some(fixture.group.to_string()));
+            assert_eq!(decoded_key.from_me, Some(true));
+            assert_eq!(
+                decoded_key.participant,
+                if index == 1 {
+                    None
+                } else {
+                    Some(fixture.own_sending.to_non_ad_string())
+                }
+            );
+        }
+        assert_eq!(target.sender(), None);
+        assert_eq!(target.to_raw_key().participant, None);
+        assert_eq!(Arc::strong_count(&content.message), 1);
+    }
+}
+
+#[tokio::test]
+async fn review_own_lid_group_addons_do_not_invent_missing_identity() {
+    let fixture = GroupSendFixture::new_lid(2).await;
+    cache_group_subtype(&fixture, Some(false)).await;
+    let content = fixture
+        .client
+        .send_message(&fixture.group, wa::Message::text("own"))
+        .await
+        .unwrap();
+    let target = content.message_ref().unwrap();
+    fixture
+        .client
+        .persistence_manager
+        .process_command(DeviceCommand::SetLid(None))
+        .await;
+    let before = fixture.transport.sent_count();
+    for result in [
+        fixture.client.send_reaction_ref(&target, "👍").await,
+        fixture
+            .client
+            .pin_message_ref(&target, PinDuration::Days7)
+            .await,
+        fixture.client.unpin_message_ref(&target).await,
+        fixture.client.keep_message_ref(&target, true).await,
+    ] {
+        assert!(matches!(
+            result,
+            Err(SendError::MessageRef(MessageRefError::MissingSender))
+        ));
+    }
+    assert_eq!(fixture.transport.sent_count(), before);
+}
+
+#[tokio::test]
+async fn review_typed_edit_validates_origin_before_group_lookup() {
+    let fixture = GroupSendFixture::new().await;
+    cache_group_subtype(&fixture, None).await;
+    let incoming = info(&fixture.group, &fixture.member, false);
+    let target = MessageRef::from_info(&incoming).unwrap();
+    assert!(matches!(
+        fixture
+            .client
+            .edit_message_ref(&target, wa::Message::text("bad"))
+            .await,
+        Err(SendError::MessageRef(MessageRefError::NotFromMe))
+    ));
+    let status = Jid::status_broadcast();
+    let target = MessageRef::new(
+        &status,
+        MessageId::new("STATUS_TARGET").unwrap(),
+        None,
+        true,
+    )
+    .unwrap();
+    assert!(matches!(
+        fixture
+            .client
+            .edit_message_ref(&target, wa::Message::text("bad"))
+            .await,
+        Err(SendError::MessageRef(MessageRefError::UnsupportedOrigin))
+    ));
+    assert_eq!(fixture.transport.sent_count(), 0);
+}
+
+#[tokio::test]
+async fn review_unknown_group_subtype_queries_and_rejects_confirmed_cag() {
+    let fixture = GroupSendFixture::new().await;
+    cache_group_subtype(&fixture, None).await;
+    let client = fixture.client.clone();
+    let chat = fixture.group.clone();
+    let query = tokio::spawn(async move {
+        let target =
+            MessageRef::new(&chat, MessageId::new("CAG_TARGET").unwrap(), None, true).unwrap();
+        client
+            .edit_message_ref(&target, wa::Message::text("bad"))
+            .await
+    });
+    let sent = crate::test_utils::decode_sent_iq(&fixture.transport, 0).await;
+    assert_eq!(sent.get().tag, "iq");
+    assert_eq!(
+        sent.get().attrs().optional_string("xmlns").as_deref(),
+        Some("w:g2")
+    );
+    let id = sent.get().attrs().optional_string("id").unwrap();
+    let response = NodeBuilder::new("iq")
+        .attr("id", &*id)
+        .attr("type", "result")
+        .children([NodeBuilder::new("group")
+            .attr("id", fixture.group.user.as_str())
+            .children([NodeBuilder::new("default_sub_group").build()])
+            .build()])
+        .build();
+    crate::test_utils::answer_iq(&fixture.client, &id, &response).await;
+    assert!(matches!(
+        query.await.unwrap(),
+        Err(SendError::InvalidRequest(_))
+    ));
+    let nodes = transport_nodes(&fixture.transport);
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0].get().tag, "iq");
+}
+
+#[tokio::test]
+async fn review_metadata_errors_preserve_source_and_rejection_allocation() {
+    use std::error::Error;
+    for edit in [true, false] {
+        let fixture = GroupSendFixture::new().await;
+        cache_group_subtype(&fixture, Some(false)).await;
+        let content = fixture
+            .client
+            .send_message(&fixture.group, wa::Message::text("own"))
+            .await
+            .unwrap();
+        if edit {
+            cache_group_subtype(&fixture, None).await;
+        } else {
+            fixture
+                .client
+                .get_group_cache()
+                .invalidate(&fixture.group)
+                .await;
+        }
+        let before = fixture.transport.sent_count();
+        let client = fixture.client.clone();
+        let query = tokio::spawn(async move {
+            let target = content.message_ref().unwrap();
+            if edit {
+                client
+                    .edit_message_ref(&target, wa::Message::text("bad"))
+                    .await
+            } else {
+                client.pin_message_ref(&target, PinDuration::Days7).await
+            }
+        });
+        let sent = crate::test_utils::decode_sent_iq(&fixture.transport, before).await;
+        assert_eq!(sent.get().tag, "iq");
+        assert_eq!(
+            sent.get().attrs().optional_string("xmlns").as_deref(),
+            Some("w:g2")
+        );
+        let id = sent.get().attrs().optional_string("id").unwrap();
+        let response = NodeBuilder::new("iq")
+            .attr("id", &*id)
+            .attr("type", "error")
+            .attr("scope", "TYPED_REFERENCE_LOOKUP")
+            .children([NodeBuilder::new("error")
+                .attr("code", "429")
+                .attr("text", "rate-overlimit")
+                .attr("type", "wait")
+                .attr("backoff", "7")
+                .build()])
+            .build();
+        let original = crate::test_utils::answer_iq(&fixture.client, &id, &response).await;
+        let error = query.await.unwrap().unwrap_err();
+        assert!(error.source().unwrap().downcast_ref::<IqError>().is_some());
+        let SendError::Iq(IqError::ServerError {
+            code,
+            text,
+            error_type,
+            backoff,
+            response,
+        }) = error
+        else {
+            panic!("the exact metadata rejection must remain typed")
+        };
+        assert_eq!(code, 429);
+        assert_eq!(text, "rate-overlimit");
+        assert_eq!(error_type.as_deref(), Some("wait"));
+        assert_eq!(backoff, Some(7));
+        assert!(Arc::ptr_eq(response.as_arc(), &original));
+        assert_eq!(
+            response.get().attrs().optional_string("scope").as_deref(),
+            Some("TYPED_REFERENCE_LOOKUP")
+        );
+        assert_eq!(fixture.transport.sent_count(), before + 1);
+        assert_eq!(
+            transport_nodes(&fixture.transport)
+                .iter()
+                .filter(|node| node.get().tag == "message")
+                .count(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn review_own_pn_group_addons_reject_missing_identity() {
+    let fixture = GroupSendFixture::new().await;
+    cache_group_subtype(&fixture, Some(false)).await;
+    let content = fixture
+        .client
+        .send_message(&fixture.group, wa::Message::text("own"))
+        .await
+        .unwrap();
+    fixture
+        .client
+        .persistence_manager
+        .process_command(DeviceCommand::SetId(None))
+        .await;
+    let target = content.message_ref().unwrap();
+    let before = fixture.transport.sent_count();
+    for result in [
+        fixture.client.send_reaction_ref(&target, "👍").await,
+        fixture
+            .client
+            .pin_message_ref(&target, PinDuration::Days7)
+            .await,
+        fixture.client.unpin_message_ref(&target).await,
+        fixture.client.keep_message_ref(&target, true).await,
+    ] {
+        assert!(matches!(result, Err(SendError::NotLoggedIn)));
+    }
+    assert_eq!(fixture.transport.sent_count(), before);
+}
+
+#[tokio::test]
+async fn review_own_status_reaction_pn_fallback_matches_raw_fanout() {
+    let (client, transport) = crate::test_utils::create_iq_test_client().await;
+    seed_dm_wire_namespace_state(&client).await;
+    let own = client.persistence_manager.get_device_snapshot();
+    let pn = own.pn.as_ref().unwrap();
+    let lid = own.lid.as_ref().unwrap();
+    client
+        .add_lid_pn_mapping(
+            &lid.user,
+            &pn.user,
+            crate::lid_pn_cache::LearningSource::Usync,
+        )
+        .await
+        .unwrap();
+    client
+        .update_device_list(wacore::store::traits::DeviceListRecord {
+            user: pn.user.as_str().into(),
+            devices: [
+                wacore::store::traits::DeviceInfo::new(0, None),
+                wacore::store::traits::DeviceInfo::new(1, None),
+            ]
+            .into(),
+            timestamp: wacore::time::now_secs(),
+            phash: None,
+            raw_id: None,
+        })
+        .await
+        .unwrap();
+    crate::test_utils::seed_peer_session(&client, &lid.with_device(1)).await;
+    let status = Jid::status_broadcast();
+    let target = MessageRef::new(
+        &status,
+        MessageId::new("OWN_STATUS_TARGET").unwrap(),
+        None,
+        true,
+    )
+    .unwrap();
+    let mut key = target.to_raw_key();
+    key.participant = Some(pn.to_non_ad_string());
+    let raw = client.send_reaction(&status, key, "👍").await.unwrap();
+    let typed = client.send_reaction_ref(&target, "👍").await.unwrap();
+    assert_eq!(operation_key(&raw, 2), operation_key(&typed, 2));
+    assert_eq!(
+        operation_key(&typed, 2).participant,
+        Some(pn.to_non_ad_string())
+    );
+    let nodes = transport_nodes(&transport);
+    let raw_node = sent_message(&nodes, &raw);
+    let typed_node = sent_message(&nodes, &typed);
+    assert_eq!(
+        participant_targets(raw_node),
+        participant_targets(typed_node)
+    );
+    assert!(!participant_targets(typed_node).is_empty());
+    for node in [raw_node, typed_node] {
+        assert_eq!(node.get().attrs().optional_jid("to"), Some(status.clone()));
+        assert_eq!(node.get().attrs().optional_string("class"), None);
+    }
+}
+
 #[tokio::test]
 async fn status_reference_reaction_and_receipts_keep_author_scope() {
     let (client, transport) = crate::test_utils::create_iq_test_client().await;

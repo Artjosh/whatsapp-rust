@@ -1,6 +1,29 @@
 use super::*;
 
 impl Client {
+    pub(crate) async fn message_ref_addon_key(
+        &self,
+        target: &crate::MessageRef<'_>,
+    ) -> Result<wa::MessageKey, SendError> {
+        let mut key = target.to_raw_key();
+        // Add-ons carry the original group author, not their own sender. A
+        // borrowed own-send reference lacks that author; resolve it here without
+        // the raw identity helper's fallback on unavailable routing/LID state.
+        if target.chat().is_group() && target.from_me() && key.participant.is_none() {
+            let routing = self.groups().routing_info(target.chat()).await?;
+            let own = self.persistence_manager.get_device_snapshot();
+            let author = match routing.addressing_mode {
+                AddressingMode::Pn => own.pn.as_ref().ok_or(SendError::NotLoggedIn)?,
+                AddressingMode::Lid => own
+                    .lid
+                    .as_ref()
+                    .ok_or(crate::MessageRefError::MissingSender)?,
+            };
+            key.participant = Some(author.to_non_ad_string());
+        }
+        Ok(key)
+    }
+
     /// Revoke using the original author/from-me scope. Own messages use a
     /// sender revoke (no participant); other authors require group admin
     /// rights, checked by the server. The reference grants no permissions.
@@ -34,8 +57,12 @@ impl Client {
         keep: bool,
     ) -> Result<SendResult, SendError> {
         target.require_chat_operation()?;
-        self.keep_message(target.chat(), target.to_raw_key(), keep)
-            .await
+        self.keep_message(
+            target.chat(),
+            self.message_ref_addon_key(target).await?,
+            keep,
+        )
+        .await
     }
 
     /// Pin the addressed message with a fresh operation id.
@@ -45,8 +72,12 @@ impl Client {
         duration: PinDuration,
     ) -> Result<SendResult, SendError> {
         target.require_chat_operation()?;
-        self.pin_message(target.chat(), target.to_raw_key(), duration)
-            .await
+        self.pin_message(
+            target.chat(),
+            self.message_ref_addon_key(target).await?,
+            duration,
+        )
+        .await
     }
 
     /// Unpin the addressed message with a fresh operation id.
@@ -55,7 +86,8 @@ impl Client {
         target: &crate::MessageRef<'_>,
     ) -> Result<SendResult, SendError> {
         target.require_chat_operation()?;
-        self.unpin_message(target.chat(), target.to_raw_key()).await
+        self.unpin_message(target.chat(), self.message_ref_addon_key(target).await?)
+            .await
     }
 
     /// Delete a message for everyone in the chat (revoke).

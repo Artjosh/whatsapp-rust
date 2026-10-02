@@ -24,7 +24,11 @@ impl Client {
         target: &crate::MessageRef<'_>,
         emoji: &str,
     ) -> Result<SendResult, SendError> {
-        let mut key = target.to_raw_key();
+        // Status reactions have supported author fanout; broadcast lists do not.
+        if target.chat().is_broadcast_list() {
+            return Err(crate::MessageRefError::UnsupportedOrigin.into());
+        }
+        let mut key = self.message_ref_addon_key(target).await?;
         if target.chat().is_status_broadcast() && key.participant.is_none() {
             key.participant = Some(self.pn().ok_or(SendError::NotLoggedIn)?.to_non_ad_string());
         }

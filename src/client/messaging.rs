@@ -177,7 +177,10 @@ impl Client {
 
     /// Edit the content addressed by an own-message reference. The emitted
     /// edit has a separate stanza id. The string/chat overload `edit_message`
-    /// remains the raw compatibility escape.
+    /// remains the raw compatibility escape. Community announcement groups
+    /// require [`Self::edit_message_encrypted`] with the original message secret,
+    /// so this plaintext helper rejects them. Establishing the group subtype
+    /// can issue a metadata IQ; rejection guarantees no message send, not no query.
     pub async fn edit_message_ref(
         &self,
         target: &crate::MessageRef<'_>,
@@ -185,6 +188,11 @@ impl Client {
     ) -> Result<crate::send::SendResult, crate::send::SendError> {
         target.require_chat_operation()?;
         target.require_own()?;
+        if target.chat().is_group() && self.is_community_announce_group(target.chat()).await? {
+            return Err(crate::send::SendError::InvalidRequest(
+                "community announcement group edits require edit_message_encrypted and the original message secret".into(),
+            ));
+        }
         self.edit_message(target.chat(), target.id().as_str(), new_content)
             .await
     }

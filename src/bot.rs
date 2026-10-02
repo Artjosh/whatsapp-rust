@@ -220,7 +220,6 @@ impl MessageContext {
                 .newsletter_server_id
                 .map(crate::ServerMessageId::new),
         )
-        .map(|r| r.with_from_me(self.info.source.is_from_me))
     }
 
     /// Referential [`wa::MessageKey`] for [`wa::message::ReactionMessage::key`].

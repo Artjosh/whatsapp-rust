@@ -1489,6 +1489,8 @@ impl InboundMessage {
     }
 
     /// Newsletter envelopes retain independent optional client/server ids.
+    /// Generic live envelopes do not establish author ownership, so `from_me`
+    /// remains unknown rather than promoting the parser's default `false`.
     pub fn newsletter_ref(
         &self,
     ) -> Result<super::message_ref::NewsletterMessageRef<'_>, super::message_ref::MessageRefError>
@@ -1501,7 +1503,6 @@ impl InboundMessage {
                 .transpose()?,
             self.info.newsletter_server_id.map(ServerMessageId::new),
         )
-        .map(|r| r.with_from_me(self.info.source.is_from_me))
     }
 }
 
