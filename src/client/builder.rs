@@ -64,7 +64,10 @@ impl ClientBuild {
     /// # async fn example(build: whatsapp_rust::ClientBuild) {
     /// let (client, receiver) = build.into_parts();
     /// while let Ok(task) = receiver.recv().await {
-    ///     client.process_sync_task(task).await;
+    ///     // Type-erase the instrumented sync future inside the host worker.
+    ///     let processing: whatsapp_rust::wacore::runtime::BoxFuture<'_, ()> =
+    ///         Box::pin(client.process_sync_task(task));
+    ///     processing.await;
     /// }
     /// # }
     /// ```
