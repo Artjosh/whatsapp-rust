@@ -1764,34 +1764,22 @@ impl Client {
         }
     }
 
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.handle_plaintext", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id, enc_type = %enc_type), err(Debug)))]
-    pub(crate) async fn handle_decrypted_plaintext(
-        self: &Arc<Self>,
+    // Keep synchronous decode/validation in one ordinary call rather than
+    // embedding it in the receive future awaited by both decrypt batches.
+    #[inline(never)]
+    fn decode_received_message(
+        &self,
+        source: bytes::Bytes,
         enc_type: &'static str,
-        padded_plaintext: Vec<u8>,
-        padding_version: u8,
-        enc_index: usize,
-        annotations: EncNodeAnnotations<'_>,
-        info: &Arc<MessageInfo>,
-    ) -> Result<PlaintextHandleOutcome, anyhow::Error> {
-        let source = wacore::messages::unpad_plaintext(padded_plaintext, padding_version)?;
-
-        // Emitted before decoding, so a payload this build cannot decode still
-        // reaches a consumer that wants it. Nothing is cloned while no lease is
-        // held, and a `Bytes` clone is a refcount bump when one is.
-        if self.decrypted_payload_forwarding_enabled() {
-            self.core.event_bus.dispatch(Event::DecryptedPayload(
-                wacore::types::events::DecryptedPayload::builder()
-                    .info(Arc::clone(info))
-                    .enc_index(enc_index)
-                    .enc_type(enc_type)
-                    .maybe_state(annotations.state.map(str::to_owned))
-                    .maybe_session_type(annotations.session_type.map(str::to_owned))
-                    .payload(source.clone())
-                    .build(),
-            ));
-        }
-
+        info: &MessageInfo,
+    ) -> Result<
+        (
+            wa::Message,
+            Option<wacore::messages::DetachedHistorySyncNotification>,
+            bool,
+        ),
+        anyhow::Error,
+    > {
         let (original_msg, history_sync_taken) =
             wacore::messages::decode_unpadded_detached_history_sync(source)?;
         log::debug!(
@@ -1868,6 +1856,40 @@ impl Client {
                 self.cancel_group_message_repair(&info.source.chat, id);
             }
         }
+
+        Ok((msg, history_sync_taken, skdm_only))
+    }
+
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.handle_plaintext", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id, enc_type = %enc_type), err(Debug)))]
+    pub(crate) async fn handle_decrypted_plaintext(
+        self: &Arc<Self>,
+        enc_type: &'static str,
+        padded_plaintext: Vec<u8>,
+        padding_version: u8,
+        enc_index: usize,
+        annotations: EncNodeAnnotations<'_>,
+        info: &Arc<MessageInfo>,
+    ) -> Result<PlaintextHandleOutcome, anyhow::Error> {
+        let source = wacore::messages::unpad_plaintext(padded_plaintext, padding_version)?;
+
+        // Emitted before decoding, so a payload this build cannot decode still
+        // reaches a consumer that wants it. Nothing is cloned while no lease is
+        // held, and a `Bytes` clone is a refcount bump when one is.
+        if self.decrypted_payload_forwarding_enabled() {
+            self.core.event_bus.dispatch(Event::DecryptedPayload(
+                wacore::types::events::DecryptedPayload::builder()
+                    .info(Arc::clone(info))
+                    .enc_index(enc_index)
+                    .enc_type(enc_type)
+                    .maybe_state(annotations.state.map(str::to_owned))
+                    .maybe_session_type(annotations.session_type.map(str::to_owned))
+                    .payload(source.clone())
+                    .build(),
+            ));
+        }
+
+        let (msg, history_sync_taken, skdm_only) =
+            self.decode_received_message(source, enc_type, info)?;
 
         // Post-decryption logic (SKDM, sync keys, etc.)
         if let Some(skdm) = msg.sender_key_distribution_message.as_option()
