@@ -93,7 +93,7 @@ async fn legacy_and_reference_message_transport_match() {
         id: Some("OWN_ORIGINAL".into()),
         participant: None,
     };
-    let raw = vec![
+    let raw = [
         client
             .edit_message(&peer, "OWN_ORIGINAL", wa::Message::text("changed"))
             .await
@@ -389,7 +389,7 @@ async fn own_dm_reference_operations_keep_content_and_operation_ids_separate() {
     let (client, transport) = crate::test_utils::create_iq_test_client().await;
     let (peer, _) = seed_dm_wire_namespace_state(&client).await;
     let own = MessageRef::new(&peer, MessageId::new("OWN_ORIGINAL").unwrap(), None, true).unwrap();
-    let results = vec![
+    let results = [
         client
             .edit_message_ref(&own, wa::Message::text("changed"))
             .await
@@ -667,7 +667,7 @@ async fn group_reference_operations_encrypt_operation_specific_keys() {
             true,
         )
         .unwrap();
-        let calls = vec![
+        let calls = [
             fixture
                 .client
                 .edit_message_ref(&own, wa::Message::text("changed"))
